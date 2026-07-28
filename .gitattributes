@@ -1,0 +1,7 @@
+# Store all text files with LF in the repository, regardless of the OS the
+# commit was made on. Keeps diffs and clones consistent across platforms.
+* text=auto
+
+# Shell scripts MUST stay LF even when checked out on Windows: a stray CR breaks
+# `bash run_all.sh` on Linux/CI with `\r: command not found`.
+*.sh text eol=lf

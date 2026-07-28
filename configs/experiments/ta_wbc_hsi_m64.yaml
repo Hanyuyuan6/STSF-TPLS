@@ -1,0 +1,55 @@
+# Task-adapted recon-then-seg: an image-only U-Net++ trained from scratch on HSI (tradgi) reconstructions (WBC, 3 classes).
+# Data produced by scripts/recon_dump.py --dataset wbc --method hsi;
+# Uses dataset 'wbc': the mask's 0/128/255 grey levels snap back to 0/1/2; the reconstructions are greyscale PNGs, so the CLAHE branch never fires.
+# Training hyperparameters are aligned exactly with rev_wbc_traditional.yaml.
+base: '../base_config.yaml'
+
+data:
+  dataset: 'wbc'
+  train_dir: 'data_recon_m64/hsi_wbc/train'
+  val_dir: 'data_recon_m64/hsi_wbc/val'
+  img_size: 128
+  bucket_size: 64
+  classes: 3
+
+model:
+  name: 'BaselineUNetPP'
+  params:
+    img_size: 128
+    classes: 3
+    in_ch: 1
+    bilinear: true
+    use_se: false
+    use_cbam: false
+    use_aspp: false
+    droppath_prob: 0
+
+training:
+  epochs: 180
+  batch_size: 6
+  early_stopping_patience: 180
+  experiment_name: 'ta_wbc_hsi_m64'
+  learning_rate: 5e-4
+  scheduler: 'CosineAnnealingLR'
+  scheduler_params:
+    T_max: 180
+    eta_min: 1e-6
+  loss:
+    seg:
+      name: 'CombinedSegmentationLoss'
+      params:
+        dice_weight: 0.5
+        ce_weight: 0.5
+    aux_recon:
+      name: 'CombinedReconLoss'
+      params:
+        l1_weight: 0.3
+        l2_weight: 0.3
+        ssim_weight: 0.4
+    seg_weight: 1.0
+    aux_recon_weight: 0.0
+    adaptive_loss:
+      enable: false
+
+inference:
+  threshold: 0.5

@@ -1,0 +1,87 @@
+project: 'single_pixel_segmentation'  # INERT: no code reads this key; kept because the released checkpoints embed it
+
+data:
+  dataset: 'carvana'                  # dataset name
+  train_dir: 'data/carvana/train'     # training data path (the loaders take its PARENT as the data root)
+  val_dir: 'data/carvana/val'         # INERT: the split is selected by mode='val', not by this path
+  img_size: 128                       # image size (width and height)
+  bucket_size: 512                    # bucket-signal length (single-pixel sensing)
+  classes: 1                         # number of classes (1 means binary)
+  preload: false                     # no preloading (preload buys only ~5% but adds ~60s startup; the bottleneck is augmentation, not loading)
+  num_workers: 8                     # 8 workers (do not oversubscribe 16 cores; measured 8 > 14, ~43s/epoch with GPU buckets)
+  bucket_on_gpu: true                # compute the bucket matrix product on the GPU (faster on carvana; the dataset then skips the CPU path).
+                                     # Keep it true when using perm_seed or bucket_noise_snr_db below: only the GPU path honours them, and train.py refuses the unsafe combination.
+  perm_seed: null                    # acquisition-order ablation: when not null, apply a fixed seeded permutation to the M rows of Phi (identical in training and evaluation)
+  bucket_noise_snr_db: null          # measurement-domain training-noise SNR (dB); null = off (evaluation noise is set by evaluate.py --noise_snr_db)
+
+augmentation:
+  train:
+    enable: true                    # enable training-time augmentation
+    horizontal_flip: 0.5            # horizontal-flip probability
+    vertical_flip: 0.0              # vertical-flip probability
+    rotate_degree: 15               # random-rotation range (+/-15 degrees)
+    brightness: 0.2                 # brightness jitter
+    contrast: 0.2                   # contrast jitter
+    gaussian_noise_std: 0.01        # Gaussian-noise standard deviation
+    random_crop_scale: [0.85, 1.0] # random-crop scale range
+  val:
+    enable: false                   # no augmentation on the validation set
+
+model:
+  name: 'FCNUNetPP'                 # model name
+  params:
+    img_size: 128                   # input image size
+    classes: 1                     # number of output classes
+    bilinear: true                  # use bilinear interpolation in the decoder
+    droppath_prob: 0                # DropPath probability (regularizer)
+
+training:
+  device: 'cuda'                   # training device (cuda or cpu)
+  epochs: 100                      # total number of epochs
+  batch_size: 16                  # batch size
+  amp: true                       # enable automatic mixed precision
+  optimizer: 'AdamW'              # optimizer type
+  learning_rate: 5e-4             # initial learning rate
+  weight_decay: 1e-4              # weight decay (L2 regularization)
+  optimizer_params: {}            # extra optimizer arguments (none)
+  scheduler: 'CosineAnnealingLR' # learning-rate scheduler type
+  scheduler_params:
+    T_max: 100                   # cosine-annealing period
+    eta_min: 1e-6                # minimum learning rate
+  loss:
+    seg:                        # segmentation-loss configuration
+      name: 'CombinedSegmentationLoss'  # combined segmentation-loss name
+      params:
+        dice_weight: 0.5         # Dice-loss weight
+        ce_weight: 0.5           # cross-entropy-loss weight
+        focal_weight: 0.0        # Focal-loss weight (unused)
+        focal_gamma: 2.0         # Focal-loss gamma
+        class_weights: null      # per-class weights (none)
+    aux_recon:                   # auxiliary reconstruction-loss configuration
+      name: 'CombinedReconLoss'  # combined reconstruction-loss name
+      params:
+        l1_weight: 0.3           # L1-loss weight
+        l2_weight: 0.3           # L2-loss weight
+        ssim_weight: 0.4         # SSIM-loss weight
+    seg_weight: 1.0              # global segmentation-loss weight (multiplies the whole segmentation loss)
+    adaptive_loss:               # adaptive loss-weight configuration (only active when enabled and aux_recon_weight > 0)
+      enable: false              # enable adaptive weight scheduling
+      stage1_ratio: 0.3          # stage-1 share of the total epochs
+      stage2_ratio: 0.3          # stage-2 share of the total epochs
+      stage1_weights: [0.1, 0.9] # stage-1 segmentation / auxiliary weight split
+      stage2_weights: [0.5, 0.5] # stage-2 weight split
+      stage3_weights: [0.9, 0.1] # stage-3 weight split
+  checkpoint_dir: 'checkpoints'   # checkpoint output directory
+  experiment_name: 'default'       # experiment name (distinguishes save paths)
+  gradient_clip: 1.0              # gradient-clipping threshold (guards against exploding gradients)
+  early_stopping_patience: 15    # early-stopping patience (epochs without improvement before stopping)
+  save_interval: 100000          # keep only the best checkpoint (periodic snapshots would fill the data disk)
+
+logging:
+  use_tensorboard: true          # enable TensorBoard logging
+  tb_logdir: 'runs'              # TensorBoard log root
+  log_images_every_n_epochs: 1  # log validation images every N epochs
+  max_log_images: 8             # maximum number of logged images
+
+inference:
+  threshold: 0.5                # binary threshold at inference time

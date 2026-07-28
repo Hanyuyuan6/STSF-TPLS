@@ -1,0 +1,68 @@
+base: '../base_config.yaml'
+
+data:
+  dataset: 'carvana'
+  train_dir: 'data_rev/carvana/train'
+  val_dir: 'data_rev/carvana/val'
+  img_size: 128
+  bucket_size: 512
+  classes: 1
+
+model:
+  name: 'GRUUNetPP'
+  params:
+    bucket_size: 512
+    img_size: 128
+    classes: 1
+    hidden_size: 256
+    num_layers: 3
+    init_feat_hw: 16
+    init_feat_ch: 32
+    seq_pool: 'meanlast'
+    seed_ch: 16
+    use_multi_scale: true
+    use_residual: false
+    use_aux_recon_head: true
+    use_se: false
+    use_cbam: false
+    use_eca: false
+    use_scse: false
+    ms_blocks: 2
+    dp_prob: 0.05
+    dropout: 0.1
+    upsample_target_ratio: 0.25
+
+training:
+  epochs: 100
+  batch_size: 16
+  early_stopping_patience: 100
+  experiment_name: 'rev_carvana_tpls_m512'
+  learning_rate: 5e-4
+  scheduler: 'CosineAnnealingLR'
+  scheduler_params:
+    T_max: 100
+    eta_min: 1e-6
+  loss:
+    seg:
+      name: 'CombinedSegmentationLoss'
+      params:
+        dice_weight: 0.5
+        ce_weight: 0.5
+    aux_recon:
+      name: 'CombinedReconLoss'
+      params:
+        l1_weight: 0.3
+        l2_weight: 0.3
+        ssim_weight: 0.4
+    seg_weight: 1.0
+    aux_recon_weight: 1.0
+    adaptive_loss:
+      enable: true
+      stage1_ratio: 0.3
+      stage2_ratio: 0.3
+      stage1_weights: [0.1, 0.9]
+      stage2_weights: [0.5, 0.5]
+      stage3_weights: [0.9, 0.1]
+
+inference:
+  threshold: 0.5

@@ -1,0 +1,51 @@
+name: tests
+
+# The anchor suite guards the correctness primitives every reported number rests on:
+# the foreground metric aggregation, the Hadamard sensing operator, the WBC label mapping,
+# the per-architecture parameter counts, and the forward physics + measurement-noise
+# injection behind the paper's regime-reversal claim. Until now it only ran when a human
+# remembered to type `pytest`.
+#
+# CPU-only on purpose: every test here is CPU-deterministic. The one CUDA test
+# (test_cpu_gpu_parity_at_the_documented_tolerance) self-skips without a GPU.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: pip
+
+      - name: Install (CPU torch — no CUDA wheels needed for the anchor suite)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch==2.3.0 torchvision==0.18.0 --index-url https://download.pytorch.org/whl/cpu
+          # Exact list verified against src/ imports (git grep): every third-party the anchor
+          # suite pulls in via src/__init__ -> trainer/metrics/models/datasets/utils. numpy<2 and
+          # kornia are pinned to the versions the tests were verified in — an unpinned latest
+          # kornia can break against torch 2.3 / numpy<2. tqdm is required by src/trainer.py:4
+          # (its omission was the original CI failure).
+          pip install "numpy==1.26.4" "kornia==0.8.2" tqdm scipy opencv-python-headless pillow \
+                      scikit-learn pyyaml tensorboard pytest
+
+      - name: Show versions
+        run: python -c "import torch, numpy; print('torch', torch.__version__, '| numpy', numpy.__version__)"
+
+      - name: Run anchor suite
+        run: python -m pytest test/ -v
+        env:
+          PYTHONPATH: ${{ github.workspace }}
