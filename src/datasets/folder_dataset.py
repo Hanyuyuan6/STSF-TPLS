@@ -4,6 +4,7 @@ from PIL import Image  # PIL, for loading and processing images
 import logging  # the logging module, for the log records
 
 
+
 class FolderSegDataset(BaseSegmentationDataset):
     """
     Generic folder-structured dataset, for the standard images/masks directory layout

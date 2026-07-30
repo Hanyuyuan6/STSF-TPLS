@@ -5,6 +5,7 @@
 base: '../base_config.yaml'
 
 data:
+  require_reconstruction_manifest: true  # fail closed if the reconstruction inventory is missing/tampered
   dataset: 'wbc'
   train_dir: 'data_recon_m128/hsi_wbc/train'
   val_dir: 'data_recon_m128/hsi_wbc/val'

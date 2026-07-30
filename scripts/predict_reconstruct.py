@@ -30,6 +30,36 @@ def to_uint8_gray(array_01: np.ndarray) -> np.ndarray:
     return (arr * 255.0 + 0.5).astype(np.uint8)
 
 
+def _usable_bucket_shape(value):
+    """Whether the array can be normalized to [B, M] by ``load_buckets``."""
+    shape = np.asarray(value).shape
+    return len(shape) in (1, 2) or (len(shape) == 3 and 1 in shape)
+
+
+def _select_keyed_array(data, requested_key, format_name):
+    """Select one usable named array, failing closed on ambiguous archives."""
+    visible = {key: value for key, value in data.items() if not key.startswith('__')}
+    shapes = ', '.join(f"{key}:{np.asarray(value).shape}" for key, value in visible.items())
+    if requested_key is not None:
+        if requested_key not in visible:
+            raise KeyError(
+                f"Requested key {requested_key!r} not found in {format_name}; "
+                f"available key/shape entries: {shapes or 'none'}")
+        return visible[requested_key]
+
+    usable = {key: value for key, value in visible.items() if _usable_bucket_shape(value)}
+    if len(usable) == 1:
+        return next(iter(usable.values()))
+    usable_shapes = ', '.join(
+        f"{key}:{np.asarray(value).shape}" for key, value in usable.items())
+    if not usable:
+        raise ValueError(
+            f"No usable bucket array in {format_name}; key/shape entries: {shapes or 'none'}")
+    raise ValueError(
+        f"Ambiguous {format_name}: multiple usable bucket arrays "
+        f"({usable_shapes}). Pass --mat_key explicitly.")
+
+
 def load_buckets(path, mat_key=None) -> np.ndarray:
     """
     Load an experimental bucket-signal file. Several formats are accepted, and all of them end up as a 2-D [B, M] array:
@@ -38,9 +68,9 @@ def load_buckets(path, mat_key=None) -> np.ndarray:
 
     Supported formats:
     - .npy: an array written by np.save
-    - .npz: an archive written by np.savez (the first key is used)
+    - .npz: an archive written by np.savez; one usable array is auto-selected, otherwise pass mat_key
     - .txt/.csv: text/comma-separated, read with numpy.loadtxt
-    - .mat: a MATLAB file; by default the first variable not starting with "__" is taken, or name one through mat_key
+    - .mat: a MATLAB file; one usable variable is auto-selected, otherwise pass mat_key
 
     Returns:
     - arr: np.ndarray of shape [B, M], dtype float32
@@ -54,10 +84,8 @@ def load_buckets(path, mat_key=None) -> np.ndarray:
         # read the numpy binary directly
         arr = np.load(p)
     elif suf == ".npz":
-        # read the archive, taking the array under the first key by default
-        data = np.load(p)
-        key = list(data.keys())[0]
-        arr = data[key]
+        with np.load(p) as data:
+            arr = np.array(_select_keyed_array(data, mat_key, 'NPZ file'))
     elif suf in [".txt", ".csv"]:
         # text read; CSV is comma-separated, TXT lets numpy infer the delimiter
         arr = np.loadtxt(p, dtype=float, delimiter=',' if suf == '.csv' else None)
@@ -67,18 +95,7 @@ def load_buckets(path, mat_key=None) -> np.ndarray:
             # scipy is not installed, so .mat files cannot be read
             raise ImportError("scipy is required to read .mat files: run pip install scipy first")
         data = sio.loadmat(p)
-        # drop the metadata keys MATLAB injects on its own (__header__, __version__, ...)
-        user_keys = [k for k in data.keys() if not k.startswith("__")]
-        if not user_keys:
-            raise ValueError("No usable data variable found in the MAT file")
-        if mat_key is not None:
-            # the variable name was given explicitly by the user
-            if mat_key not in data:
-                raise KeyError(f"The requested mat_key='{mat_key}' is not in the file. Available keys: {user_keys}")
-            arr = data[mat_key]
-        else:
-            # nothing was requested, so fall back to the first user variable
-            arr = data[user_keys[0]]
+        arr = _select_keyed_array(data, mat_key, 'MAT file')
         # fold MATLAB's possible column/row-vector shapes into a numpy array and drop the length-1 dimensions
         arr = np.array(arr)
         if arr.ndim > 2:
@@ -132,7 +149,8 @@ def main():
     parser.add_argument('--config', type=str, required=True, help='path to the config file')
     parser.add_argument('--method', type=str, required=True, choices=['tradgi', 'admm-l1'], help='reconstruction method')
     parser.add_argument('--bucket_file', type=str, required=True, help='path to the bucket-signal file')
-    parser.add_argument('--mat_key', type=str, default=None, help='name of the bucket array in the .mat file (empty: take the first non-__ key)')
+    parser.add_argument('--mat_key', type=str, default=None,
+                        help='bucket-array key for .mat/.npz; required when multiple usable arrays exist')
     parser.add_argument('--img_size', type=int, default=None, help='override the image size from the config (square)')
     parser.add_argument('--reg_weight', type=float, default=0.01, help='ADMM L1 regularization weight (admm-l1 only)')
     parser.add_argument('--steps', type=int, default=100, help='number of ADMM iterations (admm-l1 only)')
@@ -160,39 +178,22 @@ def main():
 
     # method and patterns
     if args.method == 'tradgi':
-        # build the full [N, N] Hadamard pattern matrix
-        patterns_full = get_hadamard_matrix(N, N)
-
-        if M == N:
-            # full sampling, use it as is
-            buckets_for_tradgi = buckets_raw
-            logging.info("tradgi: full sampling detected, reconstructing directly.")
-        elif M < N:
-            # undersampled: zero-pad the bucket signal along the measurement dimension up to N so the missing measurements contribute 0
-            logging.warning(f"tradgi: undersampling detected, M={M} < N={N}; the bucket signal will be zero-padded up to N.")
-            pad_len = N - M
-            # right-pad every sample with zeros (along the measurement dimension)
-            buckets_for_tradgi = np.pad(buckets_raw, pad_width=((0, 0), (0, pad_len)), mode='constant', constant_values=0.0)
-            # note: patterns_full stays [N, N], which amounts to using the first M patterns with the bucket values of the other N-M set to 0
-        else:
+        if M > N:
             # oversampled: cannot be used by tradgi as is (a Hadamard basis holds at most N orthogonal patterns)
             raise ValueError(f"tradgi does not support oversampling: M(={M}) > N(={N}). Use admm-l1, or select the first N measurements beforehand.")
-
-        patterns = None
+        patterns = get_hadamard_matrix(N, M)
+        logging.info(f"tradgi: using the acquired Hadamard rectangle ({M}, {N}) directly.")
 
     else:
-        patterns_full = None
         # admm-l1 handles any M <= N (M>N runs too but is usually pointless); build the (M, N) pattern matrix as before
         patterns = get_hadamard_matrix(N, M)
-        buckets_for_tradgi = None  # unused, only a placeholder
 
     # reconstruction
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
     if args.method == 'tradgi':
-        # reconstruct from the zero-padded bucket signal
-        recon = trad_gi_recon(patterns_full, buckets_for_tradgi, img_size, device)
+        recon = trad_gi_recon(patterns, buckets_raw, img_size, device)
     else:
         recon = admm_l1_recon(
             patterns, buckets_raw, img_size,

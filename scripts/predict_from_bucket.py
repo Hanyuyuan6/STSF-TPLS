@@ -9,6 +9,7 @@ from PIL import Image
 from scipy.io import loadmat
 
 import src.models as models
+from src.utils.checkpoint import load_checkpoint
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")  # set the logging format and level
 
@@ -24,10 +25,11 @@ def _safe_minmax_norm(x: np.ndarray) -> np.ndarray:
     return (x - xmin) / denom  # normalize into the [0,1] range
 
 
-def load_bucket(path: str, M: int) -> np.ndarray:
+def load_bucket(path: str, M: int, mat_key: str | None = None) -> np.ndarray:
     """
     Read a bucket signal from a .npy/.txt/.mat file and return a normalized 1-D vector of length M.
-    For .mat files every variable is scanned: a 1-D vector of length exactly M is preferred, otherwise a longer one is truncated.
+    For .mat files, pass mat_key when more than one suitable vector exists. Ambiguity
+    fails closed so an all-positive bucket cannot be mistaken for a differential one.
     """
     ext = os.path.splitext(path)[-1].lower()  # get the file extension
 
@@ -37,23 +39,32 @@ def load_bucket(path: str, M: int) -> np.ndarray:
         b = np.loadtxt(path)  # read the txt file
     elif ext == '.mat':
         mat = loadmat(path)  # read the mat file
-        candidates_eq = []  # candidate arrays of length exactly M
-        candidates_ge = []  # candidate arrays longer than M
-        for k, v in mat.items():
-            if k.startswith('__'):
-                continue  # skip the metadata entries of the mat file
-            a = np.array(v).squeeze()  # convert to an array and drop the redundant dimensions
-            if a.ndim == 1:
-                if a.size == M:
-                    candidates_eq.append(a)  # the length is exactly M
-                elif a.size > M:
-                    candidates_ge.append(a)  # longer than M
-        if candidates_eq:
-            b = candidates_eq[0]  # prefer the first one whose length is exactly M
-        elif candidates_ge:
-            b = candidates_ge[0][:M]  # otherwise truncate the first array longer than M
+        candidates = {}
+        for key, value in mat.items():
+            if key.startswith('__'):
+                continue
+            array = np.asarray(value).squeeze()
+            if array.ndim == 1 and array.size >= M:
+                candidates[key] = array
+        if mat_key is not None:
+            if mat_key not in mat:
+                available = sorted(key for key in mat if not key.startswith('__'))
+                raise ValueError(f"MAT key {mat_key!r} not found; available keys: {available}")
+            selected = np.asarray(mat[mat_key]).squeeze()
+            if selected.ndim != 1 or selected.size < M:
+                raise ValueError(
+                    f"MAT key {mat_key!r} has shape {selected.shape}; expected a 1-D vector "
+                    f"with at least {M} values")
+            b = selected[:M]
+        elif len(candidates) == 1:
+            b = next(iter(candidates.values()))[:M]
+        elif len(candidates) > 1:
+            desc = ', '.join(f"{key}:{value.size}" for key, value in candidates.items())
+            raise ValueError(
+                f"Ambiguous MAT file: multiple bucket vectors are usable ({desc}). "
+                "Pass --mat_key explicitly (real differential captures normally use d_B).")
         else:
-            raise ValueError(f"No suitable 1-D bucket signal found in the MAT file (length =={M} or >={M})")
+            raise ValueError(f"No suitable 1-D bucket signal found in the MAT file (length >={M})")
     else:
         raise ValueError("Only .npy/.txt/.mat files are supported")
 
@@ -75,6 +86,10 @@ def main():
     parser.add_argument('--ckpt_path', type=str, required=True, help="path to the model weights .pth")
     parser.add_argument('--save_path', type=str, default='./seg_pred.png', help="path the prediction is saved to")
     parser.add_argument('--threshold', type=float, default=None, help="binary threshold, None falls back to the config default")
+    parser.add_argument('--mat_key', type=str, default=None,
+                        help="MAT variable to load; required when several vectors fit (normally d_B for differential captures)")
+    parser.add_argument('--allow_unsafe_pickle', action='store_true',
+                        help='allow weights_only=False only for a checkpoint you independently trust')
     args = parser.parse_args()
 
     save_path = Path(args.save_path)  # resolve the save path
@@ -82,7 +97,8 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')  # pick the device
 
-    ckpt = torch.load(args.ckpt_path, map_location=device, weights_only=True)  # weights_only=True: only tensors/basic types are deserialized, blocking code execution by a malicious .pth (trusted weights only)
+    ckpt = load_checkpoint(
+        args.ckpt_path, map_location=device, allow_unsafe_pickle=args.allow_unsafe_pickle)
     cfg = ckpt['config']  # read the config
     Model = getattr(models, cfg['model']['name'])  # look the model class up dynamically
     model = Model(**cfg['model']['params']).to(device)  # instantiate the model and move it to the device
@@ -95,7 +111,7 @@ def main():
     M = int(cfg['data']['bucket_size'])  # length of the bucket signal
     num_classes = int(cfg['data']['classes'])  # number of classes
 
-    b = load_bucket(args.bucket_path, M)  # read and normalize the bucket signal, shape (M,)
+    b = load_bucket(args.bucket_path, M, mat_key=args.mat_key)  # read and normalize the bucket signal, shape (M,)
     x = torch.from_numpy(b).float().unsqueeze(0).to(device)  # to a tensor, shape (1, M)
 
     with torch.no_grad():  # turn off gradient computation to save memory

@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 import src.models as models
+from src.utils.checkpoint import load_checkpoint
 
 
 def main():
@@ -22,14 +23,12 @@ def main():
     ap.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     ap.add_argument("--warmup", type=int, default=50)
     ap.add_argument("--runs", type=int, default=500)
+    ap.add_argument("--allow_unsafe_pickle", action="store_true",
+                    help="allow weights_only=False only for a checkpoint you independently trust")
     args = ap.parse_args()
 
-    try:
-        ck = torch.load(args.ckpt, map_location="cpu", weights_only=True)
-    except Exception:
-        import warnings
-        warnings.warn("weights_only=True failed; falling back to a full (unsafe pickle) load. Only load checkpoints from a source you trust.")
-        ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    ck = load_checkpoint(
+        args.ckpt, map_location="cpu", allow_unsafe_pickle=args.allow_unsafe_pickle)
     cfg = ck["config"]
     model = getattr(models, cfg["model"]["name"])(**cfg["model"]["params"])
     model.load_state_dict(ck["model_state_dict"])

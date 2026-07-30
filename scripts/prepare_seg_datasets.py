@@ -8,6 +8,7 @@ import json
 import zipfile
 import tarfile
 import gzip
+import stat
 from tqdm import tqdm
 
 logging.basicConfig(
@@ -58,7 +59,18 @@ class SegmentationDatasetPreparer:
         logging.info(f"Extracting: {archive_path} -> {extract_to}")
         if archive_path.suffix == '.zip':  # zip format
             with zipfile.ZipFile(archive_path, 'r') as zf:
-                for member in tqdm(zf.namelist(), desc="Extracting files"):  # show a progress bar
+                dest = extract_to.resolve()
+                for member in tqdm(zf.infolist(), desc="Extracting files"):  # show a progress bar
+                    target = (extract_to / member.filename).resolve()
+                    if target != dest and dest not in target.parents:
+                        raise ValueError(
+                            f"Archive member lands outside the extraction root, extraction refused: "
+                            f"{member.filename}"
+                        )
+                    if stat.S_ISLNK(member.external_attr >> 16):
+                        raise ValueError(
+                            f"Archive symbolic link is not allowed: {member.filename}"
+                        )
                     zf.extract(member, extract_to)
         elif archive_path.suffix in ['.tar', '.tgz']:  # tar or tgz format
             with tarfile.open(archive_path, 'r:*') as tf:
@@ -69,6 +81,10 @@ class SegmentationDatasetPreparer:
                     target = (extract_to / member.name).resolve()
                     if target != dest and dest not in target.parents:
                         raise ValueError(f"Archive member lands outside the extraction root (path traversal), extraction refused: {member.name}")
+                    if not (member.isdir() or member.isreg()):
+                        raise ValueError(
+                            f"Archive non-regular member is not allowed: {member.name}"
+                        )
                     tf.extract(member, extract_to)
         elif archive_path.suffix == '.gz':  # gz format
             output_file = extract_to / archive_path.stem
@@ -76,7 +92,7 @@ class SegmentationDatasetPreparer:
                 with open(output_file, 'wb') as out_file:
                     shutil.copyfileobj(gz_file, out_file)
         else:
-            logging.warning(f"Unsupported archive format: {archive_path.suffix}")
+            raise ValueError(f"Unsupported archive format: {archive_path.suffix}")
 
     # Automatically extract every supported archive in the raw directory
     def _auto_extract_raw(self, raw_dir: Path):

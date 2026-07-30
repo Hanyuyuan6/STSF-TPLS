@@ -6,6 +6,7 @@ import numpy as np
 from src.metrics.segmentation_metrics import batch_segmentation_metrics
 from src.utils.tb_logger import TBLogger
 from src.utils.model_utils import count_parameters
+from src.utils.gradient_diagnostics import append_jsonl, measure_loss_gradients
 
 
 class SegmentationTrainer:
@@ -24,8 +25,12 @@ class SegmentationTrainer:
         self.cfg = config
 
         self.epochs = int(config['training']['epochs'])
-        self.amp = bool(config['training']['amp'])
+        self.amp = bool(config['training']['amp'] and self.device.type == 'cuda')
         self.grad_clip = float(config['training'].get('gradient_clip', 1.0))
+        max_steps = config['training'].get('max_steps_per_epoch')
+        self.max_steps_per_epoch = int(max_steps) if max_steps is not None else None
+        if self.max_steps_per_epoch is not None and self.max_steps_per_epoch <= 0:
+            raise ValueError("training.max_steps_per_epoch must be a positive integer")
         self.num_classes = int(config['data']['classes'])
         self.input_type = getattr(model, 'input_type', 'bucket')
         # bucket_on_gpu: compute the bucket in batch on the GPU (speeds up carvana; augmentation -> it must be recomputed every epoch -> put it on the GPU)
@@ -62,10 +67,63 @@ class SegmentationTrainer:
                 logging.warning("Adaptive weighting was requested, but aux_recon_weight=0; adaptive weighting will be disabled.")
             self.use_adaptive = False
 
-        self.ckpt_dir = Path(config['training']['checkpoint_dir']) / config['training']['experiment_name']
-        self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+        diagnostic_cfg = config['training'].get('gradient_diagnostics', {}) or {}
+        diagnostic_path = diagnostic_cfg.get('jsonl')
+        self.gradient_diagnostics_path = Path(diagnostic_path) if diagnostic_path else None
+        self.gradient_run_label = str(diagnostic_cfg.get('run_label', 'run'))
+        self.gradient_seed = int(diagnostic_cfg.get('seed', config['training'].get('seed', 42)))
+        self.gradient_global_step = 0
+        self.gradient_stepwise_schedule = bool(diagnostic_cfg.get('stepwise_schedule', False))
+        self.gradient_total_steps = None
+        if self.gradient_diagnostics_path is not None:
+            if self.base_aux_weight <= 0.0:
+                raise ValueError("gradient diagnostics require aux_recon_weight > 0")
+            if self.gradient_diagnostics_path.exists():
+                raise FileExistsError(
+                    f"refusing to append to existing gradient diagnostics: "
+                    f"{self.gradient_diagnostics_path}"
+                )
+        if self.gradient_stepwise_schedule:
+            if self.gradient_diagnostics_path is None:
+                raise ValueError("stepwise adaptive scheduling is restricted to an explicit diagnostic run")
+            if not self.use_adaptive:
+                raise ValueError("stepwise adaptive scheduling requires adaptive_loss.enable=true")
+            if self.max_steps_per_epoch is None:
+                raise ValueError("stepwise adaptive scheduling requires max_steps_per_epoch")
+            self.gradient_total_steps = self.epochs * self.max_steps_per_epoch
+            self.gradient_stage1_end, self.gradient_stage2_end = self._stepwise_boundaries(
+                self.gradient_total_steps,
+                self.adaptive_loss.get('stage1_ratio', 0.3),
+                self.adaptive_loss.get('stage2_ratio', 0.3),
+            )
+            if not (0 < self.gradient_stage1_end < self.gradient_stage2_end < self.gradient_total_steps):
+                raise ValueError(
+                    "stepwise phase ratios must produce three non-empty phases over the configured steps"
+                )
 
-        self.use_tb = bool(config['logging'].get('use_tensorboard', True))
+        self.ckpt_dir = Path(config['training']['checkpoint_dir']) / config['training']['experiment_name']
+        requested_tb = bool(config['logging'].get('use_tensorboard', True))
+        tb_dir = Path(config['logging'].get('tb_logdir', 'runs')) / config['training']['experiment_name']
+        if config['training'].get('refuse_existing_output', False):
+            self.ckpt_dir.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                self.ckpt_dir.mkdir()
+            except FileExistsError as exc:
+                raise FileExistsError(
+                    f"refusing to reuse existing checkpoint directory: {self.ckpt_dir}"
+                ) from exc
+            if requested_tb:
+                tb_dir.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    tb_dir.mkdir()
+                except FileExistsError as exc:
+                    raise FileExistsError(
+                        f"refusing to reuse existing TensorBoard directory: {tb_dir}"
+                    ) from exc
+        else:
+            self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        self.use_tb = requested_tb
         if self.use_tb:
             try:
                 self.tb = TBLogger(
@@ -82,7 +140,7 @@ class SegmentationTrainer:
         else:
             self.tb = None
 
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp)
+        self.scaler = torch.amp.GradScaler(device='cuda', enabled=self.amp)
 
         logging.info(f"Model: {config['model']['name']}")
         logging.info(f"Parameters: {count_parameters(self.model):,}")
@@ -103,6 +161,15 @@ class SegmentationTrainer:
             a, b = 0.5, 0.5
         return a, b
 
+    @staticmethod
+    def _stepwise_boundaries(total_steps, stage1_ratio, stage2_ratio):
+        stage1 = max(0.0, min(1.0, float(stage1_ratio)))
+        stage2 = max(0.0, min(1.0, float(stage2_ratio)))
+        return (
+            round(total_steps * stage1),
+            round(total_steps * min(1.0, stage1 + stage2)),
+        )
+
     def _get_adaptive_weights(self, epoch):
         if not self.use_adaptive:
             return self.base_seg_weight, self.base_aux_weight
@@ -116,6 +183,31 @@ class SegmentationTrainer:
 
         return self.base_seg_weight * seg_w, self.base_aux_weight * aux_w
 
+    def _phase_name(self, epoch):
+        if not self.use_adaptive:
+            return "fixed"
+        if epoch <= self.stage1_epochs:
+            return "early"
+        if epoch <= self.stage1_epochs + self.stage2_epochs:
+            return "middle"
+        return "late"
+
+    def _get_stepwise_weights(self, global_step):
+        """Return the phase and weights for a one-based diagnostic optimizer step."""
+        if not self.gradient_stepwise_schedule or self.gradient_total_steps is None:
+            raise RuntimeError("stepwise gradient scheduling is not enabled")
+        if not 1 <= global_step <= self.gradient_total_steps:
+            raise ValueError(
+                f"global_step must be in [1, {self.gradient_total_steps}], got {global_step}"
+            )
+        if global_step <= self.gradient_stage1_end:
+            phase, (seg_w, aux_w) = "early", self.stage1_weights
+        elif global_step <= self.gradient_stage2_end:
+            phase, (seg_w, aux_w) = "middle", self.stage2_weights
+        else:
+            phase, (seg_w, aux_w) = "late", self.stage3_weights
+        return phase, (self.base_seg_weight * seg_w, self.base_aux_weight * aux_w)
+
     def train(self):
         logging.info(f"Starting training: {self.epochs} epochs")
 
@@ -125,7 +217,13 @@ class SegmentationTrainer:
                 logging.info(f"Epoch {epoch} top-level weights: seg={seg_w:.3f}, aux={aux_w:.3f}")
 
             train_loss, train_metrics = self._train_epoch(epoch, seg_w, aux_w)
-            val_loss, val_metrics = self._validate_epoch(epoch, seg_w, aux_w)
+            if self.gradient_stepwise_schedule:
+                _, (val_seg_w, val_aux_w) = self._get_stepwise_weights(
+                    min(self.gradient_global_step, self.gradient_total_steps)
+                )
+            else:
+                val_seg_w, val_aux_w = seg_w, aux_w
+            val_loss, val_metrics = self._validate_epoch(epoch, val_seg_w, val_aux_w)
 
             if self.scheduler:
                 if 'ReduceLROnPlateau' in self.scheduler.__class__.__name__:
@@ -173,25 +271,72 @@ class SegmentationTrainer:
         num_aux_samples = 0
         _train_noisy = self.train_bucket_snr_db is not None
         preds, gts = [], []
+        num_batches = 0
 
         pbar = tqdm(self.train_loader, desc=f"Train Epoch {epoch}/{self.epochs}")
 
         for batch_idx, batch in enumerate(pbar):
+            if self.max_steps_per_epoch is not None and batch_idx >= self.max_steps_per_epoch:
+                break
+            runtime_seg_weight = float(seg_weight)
+            runtime_aux_weight = float(aux_weight)
+            runtime_phase = self._phase_name(epoch)
+            if self.gradient_stepwise_schedule:
+                runtime_phase, (runtime_seg_weight, runtime_aux_weight) = (
+                    self._get_stepwise_weights(self.gradient_global_step + 1)
+                )
             x, image, mask = self._get_input(batch, noisy=_train_noisy)
 
-            with torch.cuda.amp.autocast(enabled=self.amp):
+            with torch.amp.autocast(device_type='cuda', enabled=self.amp):
                 output = self.model(x)
                 logits = output['logits']
 
                 seg_loss = self.criterion_seg(logits, mask)
-                loss = float(seg_weight) * seg_loss
+                loss = runtime_seg_weight * seg_loss
                 total_seg_loss += float(seg_loss.item())
 
-                if aux_weight > 0 and output.get('aux_recon') is not None:
+                aux_loss = None
+                if runtime_aux_weight > 0 and output.get('aux_recon') is not None:
                     aux_loss = self.criterion_aux(output['aux_recon'], image)
-                    loss = loss + float(aux_weight) * aux_loss
+                    loss = loss + runtime_aux_weight * aux_loss
                     total_aux_loss += float(aux_loss.item())
                     num_aux_samples += 1
+
+            if not torch.isfinite(loss):
+                raise FloatingPointError(
+                    f"non-finite training loss at epoch={epoch}, batch={batch_idx + 1}: "
+                    f"{float(loss.detach().cpu())}"
+                )
+
+            if self.gradient_diagnostics_path is not None:
+                if aux_loss is None:
+                    raise RuntimeError(
+                        "gradient diagnostics require an auxiliary reconstruction output and loss"
+                    )
+                geometry = measure_loss_gradients(
+                    seg_loss,
+                    aux_loss,
+                    self.model.parameters(),
+                    seg_weight=runtime_seg_weight,
+                    aux_weight=runtime_aux_weight,
+                )
+                append_jsonl(
+                    self.gradient_diagnostics_path,
+                    {
+                        "run_label": self.gradient_run_label,
+                        "seed": self.gradient_seed,
+                        "epoch": epoch,
+                        "step_in_epoch": batch_idx + 1,
+                        "global_step": self.gradient_global_step + 1,
+                        "phase": runtime_phase,
+                        "seg_weight": runtime_seg_weight,
+                        "aux_weight": runtime_aux_weight,
+                        "seg_loss": float(seg_loss.detach().item()),
+                        "aux_loss": float(aux_loss.detach().item()),
+                        **geometry,
+                    },
+                )
+                self.gradient_global_step += 1
 
             self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()
@@ -204,6 +349,7 @@ class SegmentationTrainer:
             self.scaler.update()
 
             total_loss += float(loss.item())
+            num_batches += 1
 
             with torch.no_grad():
                 if self.num_classes == 1:
@@ -214,16 +360,22 @@ class SegmentationTrainer:
                 gts.append(mask.cpu())
 
             pbar.set_postfix({'loss': f"{float(loss.item()):.4f}",
-                              'seg_w': f"{seg_weight:.2f}",
-                              'aux_w': f"{aux_weight:.2f}"})
+                              'seg_w': f"{runtime_seg_weight:.2f}",
+                              'aux_w': f"{runtime_aux_weight:.2f}"})
 
         P = torch.cat(preds, 0).numpy()
         G = torch.cat(gts, 0).numpy()
         metrics = batch_segmentation_metrics(P, G, num_classes=max(2, self.num_classes))
 
-        avg_loss = total_loss / max(1, len(self.train_loader))
-        avg_seg_loss = total_seg_loss / max(1, len(self.train_loader))
+        if num_batches == 0:
+            raise RuntimeError("training loader produced no complete batches")
+        avg_loss = total_loss / num_batches
+        avg_seg_loss = total_seg_loss / num_batches
         avg_aux_loss = total_aux_loss / max(1, num_aux_samples) if num_aux_samples > 0 else 0
+
+        finite_values = [avg_loss, avg_seg_loss, avg_aux_loss, *metrics.values()]
+        if not all(np.isfinite(float(value)) for value in finite_values):
+            raise FloatingPointError(f"non-finite training summary at epoch={epoch}")
 
         if self.tb:
             log_dict = {
@@ -304,6 +456,10 @@ class SegmentationTrainer:
         avg_loss = total_loss / max(1, len(self.val_loader))
         avg_seg_loss = total_seg_loss / max(1, len(self.val_loader))
         avg_aux_loss = total_aux_loss / max(1, num_aux_samples) if num_aux_samples > 0 else 0
+
+        finite_values = [avg_loss, avg_seg_loss, avg_aux_loss, *metrics.values()]
+        if not all(np.isfinite(float(value)) for value in finite_values):
+            raise FloatingPointError(f"non-finite validation summary at epoch={epoch}")
 
         if self.tb:
             log_dict = {

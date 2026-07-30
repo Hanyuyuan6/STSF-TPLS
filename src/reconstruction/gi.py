@@ -4,12 +4,12 @@ import numpy as np
 import torch
 
 
-def trad_gi_recon(patterns_full, buckets_raw, img_size, device=None):
+def trad_gi_recon(patterns, buckets_raw, img_size, device=None):
     """
     Conventional ghost-imaging reconstruction
 
     Args:
-        patterns_full: (N, N) numpy array, the full Hadamard matrix
+        patterns: (M, N) numpy array, the acquired Hadamard rows
         buckets_raw: (B, M) numpy array, the raw bucket signals (not normalized)
         img_size: int, the image side length
         device: torch device
@@ -19,19 +19,19 @@ def trad_gi_recon(patterns_full, buckets_raw, img_size, device=None):
     """
     device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
 
-    N = patterns_full.shape[0]
     B, M = buckets_raw.shape
+    N = img_size * img_size
+    if patterns.shape != (M, N):
+        raise ValueError(
+            f"patterns must match buckets as (M,N)=({M},{N}), got {patterns.shape}")
 
     # convert to torch tensors
-    H_full = torch.from_numpy(patterns_full).float().to(device)  # (N, N)
+    H_acquired = torch.from_numpy(patterns).float().to(device)   # (M, N)
     buckets = torch.from_numpy(buckets_raw).float().to(device)   # (B, M)
 
-    # zero-pad up to N
-    bucket_pad = torch.zeros(B, N, device=device, dtype=torch.float32)
-    bucket_pad[:, :M] = buckets
-
-    # inverse Hadamard transform
-    img_vec = torch.matmul(bucket_pad, H_full)  # (B, N)
+    # Adjoint of the acquired rows. This is exactly the old zero-pad @ H_full
+    # computation without allocating the unused (N-M) rows.
+    img_vec = torch.matmul(buckets, H_acquired)  # (B, N)
 
     # reshape into an image
     img = img_vec.view(B, img_size, img_size)  # (B, H, W)

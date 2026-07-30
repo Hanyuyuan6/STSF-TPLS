@@ -136,9 +136,8 @@ def predict_bucket(model, thr, bucket_raw_M):
     return mask
 
 
-def predict_ta(model, thr, bucket_raw_M, H_full):
-    pad = np.zeros((1, N), dtype=np.float32); pad[:, :M] = bucket_raw_M[None, :]
-    rec = trad_gi_recon(H_full, pad, IMG, DEV)           # (1,1,H,W) in [0,1]
+def predict_ta(model, thr, bucket_raw_M, phi):
+    rec = trad_gi_recon(phi, bucket_raw_M[None, :], IMG, DEV)  # (1,1,H,W) in [0,1]
     recimg = rec[0, 0]
     rt = torch.from_numpy(recimg[None, None]).float().to(DEV)
     with torch.no_grad():
@@ -167,7 +166,6 @@ def main():
           f'gt_fg_pct={100*gt.mean():.2f}%')
 
     phi = get_hadamard_matrix(N, M).astype(np.float32)   # (M, N) natural-order Sylvester
-    H_full = get_hadamard_matrix(N, N).astype(np.float32)
     sim_bucket = (phi @ img128.reshape(-1)).astype(np.float32)  # (M,) raw clean measurement
 
     models_loaded = {}
@@ -193,7 +191,7 @@ def main():
         masks[rk] = {}
         for meth, (mdl, thr, itype) in models_loaded.items():
             if meth == 'TA_HSI':
-                mask, rec = predict_ta(mdl, thr, bucket, H_full)
+                mask, rec = predict_ta(mdl, thr, bucket, phi)
                 Image.fromarray((rec * 255).clip(0, 255).astype(np.uint8)).save(OUT / f'{rk}_{meth}_recon.png')
             else:
                 mask = predict_bucket(mdl, thr, bucket)

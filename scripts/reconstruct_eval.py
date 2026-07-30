@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import re
 from pathlib import Path
 import numpy as np
 import torch
@@ -15,6 +16,44 @@ from src.utils.ghost_patterns import get_hadamard_matrix
 from src.reconstruction import trad_gi_recon, admm_l1_recon, fista_l1_recon
 import src.models as models
 from src.metrics.segmentation_metrics import batch_segmentation_metrics
+from src.utils.checkpoint import load_checkpoint
+
+
+_CHECKPOINT_CONFIG_FIELDS = (
+    ('model', 'name'),
+    ('model', 'params'),
+    ('data', 'dataset'),
+    ('data', 'img_size'),
+    ('data', 'classes'),
+    ('data', 'bucket_size'),
+    ('inference', 'threshold'),
+)
+
+
+def _nested(config, path):
+    value = config
+    for key in path:
+        value = value[key]
+    return value
+
+
+def validate_checkpoint_config(external_config, checkpoint_config):
+    """Reject a checkpoint/config pairing that could silently relabel an evaluation."""
+    mismatches = []
+    for path in _CHECKPOINT_CONFIG_FIELDS:
+        try:
+            external_value = _nested(external_config, path)
+            checkpoint_value = _nested(checkpoint_config, path)
+        except (KeyError, TypeError):
+            mismatches.append(f"{'.'.join(path)} missing")
+            continue
+        if external_value != checkpoint_value:
+            mismatches.append(
+                f"{'.'.join(path)}: external={external_value!r}, checkpoint={checkpoint_value!r}")
+    if mismatches:
+        raise ValueError(
+            "Checkpoint/config mismatch in load-bearing fields; refusing to evaluate:\n  - "
+            + "\n  - ".join(mismatches))
 
 
 def to_uint8_gray(array_01):
@@ -100,7 +139,10 @@ def main():
     parser.add_argument('--save_all', action='store_true', help='save the visualization of every sample (image/recon/mask/pred)')
     parser.add_argument('--split', type=str, default='val', choices=['train', 'val', 'test'],
                         help='which split to evaluate; the final numbers of the paper are reported on test')
-    parser.add_argument('--out_json', type=str, default=None, help='write the metrics to this JSON (standalone: merge_results.py only ingests noise evals)')
+    parser.add_argument('--out_json', type=str, default=None,
+                        help='write metrics JSON consumable by merge_results.py')
+    parser.add_argument('--allow_unsafe_pickle', action='store_true',
+                        help='allow weights_only=False only for a checkpoint you independently trust')
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -146,24 +188,17 @@ def main():
         pin_memory=True
     )
 
-    # safe loader first; full training checkpoints embed a config dict, so fall back only for files you trust.
-    try:
-        ckpt = torch.load(args.ckpt_path, map_location=device, weights_only=True)
-    except Exception:
-        import warnings
-        warnings.warn("weights_only=True failed; falling back to a full (unsafe pickle) load. Only load checkpoints from a source you trust.")
-        ckpt = torch.load(args.ckpt_path, map_location=device, weights_only=False)
+    ckpt = load_checkpoint(
+        args.ckpt_path, map_location=device, allow_unsafe_pickle=args.allow_unsafe_pickle)
+    if 'config' not in ckpt:
+        raise ValueError("Checkpoint has no embedded config; cannot verify it against --config")
+    validate_checkpoint_config(cfg, ckpt['config'])
     Model = getattr(models, cfg['model']['name'])
     seg_model = Model(**cfg['model']['params']).to(device)
     seg_model.load_state_dict(ckpt['model_state_dict'])
     seg_model.eval()
 
-    if args.method == 'tradgi':
-        patterns_full = get_hadamard_matrix(N, N)
-        patterns = None
-    else:
-        patterns_full = None
-        patterns = get_hadamard_matrix(N, M)
+    patterns = get_hadamard_matrix(N, M)
 
     all_preds, all_masks = [], []
     vis_gt_imgs, vis_rec_imgs, vis_gt_masks, vis_pred_masks = [], [], [], []
@@ -195,7 +230,7 @@ def main():
         B = buckets_raw.shape[0]
 
         if args.method == 'tradgi':
-            recon_images = trad_gi_recon(patterns_full, buckets_raw, img_size, device)
+            recon_images = trad_gi_recon(patterns, buckets_raw, img_size, device)
         elif args.method == 'admm-l1':
             recon_images = admm_l1_recon(
                 patterns, buckets_raw, img_size,
@@ -270,11 +305,23 @@ def main():
         import json
         outp = Path(args.out_json)
         outp.parent.mkdir(parents=True, exist_ok=True)
+        experiment_name = ckpt['config'].get('training', {}).get('experiment_name', '')
+        seed_match = re.search(r'_s(\d+)$', experiment_name)
+        if seed_match is None:
+            seed_match = re.search(r'_s(\d+)', str(args.ckpt_path))
+        train_seed = ckpt.get('seed')
+        if train_seed is None and seed_match is not None:
+            train_seed = int(seed_match.group(1))
         with open(outp, 'w') as f:
             json.dump({
                 'method': args.method, 'split': args.split,
                 'sampling_rate': actual_sr, 'samples': int(sample_count),
                 'dataset': cfg['data']['dataset'],
+                'bucket_size': M,
+                'ckpt': args.ckpt_path,
+                'experiment_name': experiment_name,
+                'model': cfg['model']['name'],
+                'train_seed': train_seed,
                 'metrics': {k: float(v) for k, v in metrics.items()},
             }, f, indent=2)
         logging.info(f"Metrics JSON: {outp}")

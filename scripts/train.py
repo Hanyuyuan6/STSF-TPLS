@@ -1,6 +1,7 @@
 import os
 import argparse
 import logging
+import re
 import torch
 from torch.utils.data import DataLoader
 
@@ -50,9 +51,29 @@ def main(args):
         cfg['training']['epochs'] = args.epochs  # command line overrides the number of epochs
     if args.batch_size:
         cfg['training']['batch_size'] = args.batch_size  # command line overrides the batch size
+    if args.max_steps_per_epoch is not None:
+        cfg['training']['max_steps_per_epoch'] = args.max_steps_per_epoch
+    if args.refuse_existing_output:
+        cfg['training']['refuse_existing_output'] = True
+
+    cfg['training']['seed'] = args.seed
+    run_label = args.run_label or f"seed{args.seed}"
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", run_label):
+        raise ValueError("--run_label may contain only letters, digits, dot, underscore, and hyphen")
+    if args.gradient_diagnostics_jsonl:
+        cfg['training']['gradient_diagnostics'] = {
+            'jsonl': args.gradient_diagnostics_jsonl,
+            'run_label': run_label,
+            'seed': args.seed,
+            'stepwise_schedule': args.gradient_stepwise_schedule,
+        }
+    elif args.gradient_stepwise_schedule:
+        raise ValueError("--gradient_stepwise_schedule requires --gradient_diagnostics_jsonl")
 
     # one checkpoint directory per seed, so several seeds do not overwrite each other
     cfg['training']['experiment_name'] = f"{cfg['training']['experiment_name']}_s{args.seed}"
+    if args.run_label:
+        cfg['training']['experiment_name'] += f"_{run_label}"
 
     # bucket_on_gpu: move the bucket matmul to the GPU (trainer computes it on the fly), dataset skips the CPU-side computation (carvana speedup)
     bucket_on_gpu = bool(cfg['data'].get('bucket_on_gpu', False))
@@ -86,6 +107,10 @@ def main(args):
     base_root = str(Path(cfg['data']['train_dir']).parent)  # take the parent of the train directory as the data root
 
     logging.info(f"Creating dataset: {cfg['data']['dataset']}")
+    require_reconstruction_manifest = bool(
+        cfg['data'].get('require_reconstruction_manifest', False)
+        or str(cfg['training'].get('experiment_name', '')).startswith('ta_')
+    )
 
     train_set = get_dataset(
         cfg['data']['dataset'],
@@ -97,7 +122,8 @@ def main(args):
         preload=cfg['data'].get('preload', False),
         augmentation=aug_train,
         transform=None,
-        compute_bucket=not bucket_on_gpu
+        compute_bucket=not bucket_on_gpu,
+        require_reconstruction_manifest=require_reconstruction_manifest,
     )  # build the training dataset object
 
     val_set = get_dataset(
@@ -110,7 +136,8 @@ def main(args):
         preload=False,
         augmentation=aug_val,
         transform=None,
-        compute_bucket=not bucket_on_gpu
+        compute_bucket=not bucket_on_gpu,
+        require_reconstruction_manifest=require_reconstruction_manifest,
     )  # build the validation dataset object
 
     g = torch.Generator()
@@ -208,6 +235,16 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=None, help="override the number of epochs")
     parser.add_argument('--batch_size', type=int, default=None, help="override the batch size")
     parser.add_argument('--seed', type=int, default=42, help="random seed (keeps the checkpoint directories apart when running several seeds)")
+    parser.add_argument('--max_steps_per_epoch', type=int, default=None,
+                        help="limit optimizer steps per epoch (used by the paper's instrumented protocol)")
+    parser.add_argument('--refuse_existing_output', action='store_true',
+                        help="fail if this run's checkpoint or TensorBoard directory already exists")
+    parser.add_argument('--gradient_diagnostics_jsonl', type=str, default=None,
+                        help="write per-step unweighted gradient geometry and weighted TPLS pull to JSONL")
+    parser.add_argument('--gradient_stepwise_schedule', action='store_true',
+                        help="compress adaptive phase ratios over optimizer steps (Supplement S6)")
+    parser.add_argument('--run_label', type=str, default=None,
+                        help="safe label appended to the experiment directory and diagnostic records")
 
     args = parser.parse_args()
     main(args)

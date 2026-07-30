@@ -10,12 +10,14 @@ import logging
 import torch
 
 from src.utils.ghost_patterns import get_hadamard_matrix_cached
+from src.utils.reconstruction_manifest import validate_reconstruction_manifest
 
 
 class BaseSegmentationDataset(Dataset, ABC):
     def __init__(self, root_dir, bucket_size, img_size, num_classes,
                  mode='train', preload=False, augmentation=None, transform=None, num_workers=None,
-                 compute_bucket=True, perm_seed=None, bucket_noise_snr_db=None):
+                 compute_bucket=True, perm_seed=None, bucket_noise_snr_db=None,
+                 require_reconstruction_manifest=False):
         self.root_dir = Path(root_dir)  # path to the dataset root directory
         self.mode = mode  # split: train, val, test, ...
         self.bucket_size = bucket_size  # length of the bucket signal
@@ -31,6 +33,14 @@ class BaseSegmentationDataset(Dataset, ABC):
         if num_workers is None:
             num_workers = max(1, mp.cpu_count() // 2)  # default to half the CPU cores
         self.num_workers = num_workers  # number of worker processes reading the data
+
+        split_dir = self.root_dir / self.mode
+        is_reconstruction_root = any(
+            part.lower().startswith('data_recon') for part in self.root_dir.parts
+        )
+        if (require_reconstruction_manifest or is_reconstruction_root
+                or (split_dir / '_dump_meta.json').exists()):
+            validate_reconstruction_manifest(split_dir)
 
         self.samples = self._scan_samples()  # scan the list of sample files
         if len(self.samples) == 0:

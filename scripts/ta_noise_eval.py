@@ -41,11 +41,9 @@ H_gpu = None
 def adjoint_recon(noisy_raw):  # gi.py verbatim semantics
     global H_gpu
     if H_gpu is None:
-        H_gpu = torch.from_numpy(get_hadamard_matrix(N, N).astype(np.float32)).to(DEV)
+        H_gpu = torch.from_numpy(get_hadamard_matrix(N, M).astype(np.float32)).to(DEV)
     B = noisy_raw.size(0)
-    pad = torch.zeros(B, N, device=DEV)
-    pad[:, :M] = noisy_raw
-    img = (pad @ H_gpu).view(B, IMG, IMG)
+    img = (noisy_raw @ H_gpu).view(B, IMG, IMG)
     img = img - img.mean(dim=[1, 2], keepdim=True)
     mn = img.amin(dim=[1, 2], keepdim=True); mx = img.amax(dim=[1, 2], keepdim=True)
     return ((img - mn) / (mx - mn + 1e-8)).unsqueeze(1)

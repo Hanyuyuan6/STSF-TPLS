@@ -45,7 +45,7 @@ n_seg, seg = make("configs/experiments/rev_carvana_traditional.yaml")  # Baselin
 bucket = torch.randn(B, M, device=DEVICE)
 
 # ---- preloaded operators (setup, NOT timed) ----
-H_full = torch.from_numpy(get_hadamard_matrix(N, N)).float().to(DEVICE)        # GI: (N,N)
+H_acquired = torch.from_numpy(get_hadamard_matrix(N, M)).float().to(DEVICE)    # GI: (M,N)
 patterns = _ensure_A_MN(get_hadamard_matrix(N, M), IMG)                        # ADMM: (M,N)
 Psi = torch.from_numpy(dct_2d_matrix(IMG)).float().to(DEVICE)
 A_Psi = torch.from_numpy(patterns).float().to(DEVICE) @ Psi
@@ -54,8 +54,7 @@ inv_term = torch.linalg.inv(torch.eye(M, device=DEVICE) + (A_Psi @ AT_Psi) / 1.0
 
 
 def gi_core(bk):
-    pad = torch.zeros(B, N, device=DEVICE); pad[:, :M] = bk
-    img = (pad @ H_full).view(B, IMG, IMG)
+    img = (bk @ H_acquired).view(B, IMG, IMG)
     img = img - img.mean(dim=[1, 2], keepdim=True)
     mn = img.amin(dim=[1, 2], keepdim=True); mx = img.amax(dim=[1, 2], keepdim=True)
     return ((img - mn) / (mx - mn + 1e-8)).unsqueeze(1)

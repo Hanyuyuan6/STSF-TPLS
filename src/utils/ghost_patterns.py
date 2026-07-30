@@ -1,6 +1,5 @@
 """Hadamard pattern generation utilities"""
 
-import scipy.linalg
 import numpy as np
 import functools
 import logging
@@ -37,17 +36,30 @@ def get_hadamard_matrix(N, M, perm_seed=None):
     Returns:
         (M, N) numpy array, the first M Hadamard bases (optionally reordered by perm_seed)
     """
-    # find the smallest power of 2
-    n = 2 ** int(np.ceil(np.log2(max(N, M))))
+    if not isinstance(N, (int, np.integer)) or N <= 0 or N & (N - 1):
+        raise ValueError(
+            f"N must be a positive power of two so the returned rows remain orthogonal; got {N!r}"
+        )
+    if not isinstance(M, (int, np.integer)) or not 1 <= M <= N:
+        raise ValueError(f"M must be an integer satisfying 1 <= M <= N; got M={M!r}, N={N!r}")
+    n = int(N)
 
-    # generate the full Hadamard matrix
-    H = scipy.linalg.hadamard(n, dtype=np.float32)
-
-    # normalization (optional, as needed)
-    # H = H / np.sqrt(n)
-
-    # take the first M rows and the first N columns
-    H_sub = H[:M, :N]
+    # Sylvester natural-order entry H[r,c] = (-1)^popcount(r & c). Computing
+    # only the requested rectangle avoids materialising the full n×n matrix
+    # (n=16384 would otherwise require about 1 GiB in float32).
+    if n <= 2 ** 8:
+        uint, shifts = np.uint8, (4, 2, 1)
+    elif n <= 2 ** 16:
+        uint, shifts = np.uint16, (8, 4, 2, 1)
+    elif n <= 2 ** 32:
+        uint, shifts = np.uint32, (16, 8, 4, 2, 1)
+    else:
+        uint, shifts = np.uint64, (32, 16, 8, 4, 2, 1)
+    parity = np.bitwise_and(
+        np.arange(M, dtype=uint)[:, None], np.arange(N, dtype=uint)[None, :])
+    for shift in shifts:
+        parity ^= parity >> shift
+    H_sub = 1.0 - 2.0 * (parity & 1).astype(np.float32)
 
     # acquisition-order ablation: fixed seeded row permutation (independent RNG, leaves the global random state untouched)
     if perm_seed is not None:

@@ -1,99 +1,191 @@
 # -*- coding: utf-8 -*-
-"""Merge per-run eval JSONs into the results CSV (stdlib, NO torch).
+"""Merge clean and noise evaluation JSONs into the canonical results CSV.
 
-Scans <repo>/checkpoints/<run>/eval/*.json (plus an optional <repo>/incoming staging dir),
-maps each noise-eval JSON to a row of the 19-col schema, and dedups by `experiment`.
-- image-free s43/s44 noise -> family=noise_ac
-- TA seed noise (s43/s44)  -> family=ta_noise
-- naug (naug20/naugmix)    -> family=ta_noise_naug (mechanism probe, not the deployed baseline)
-Writes a STAGING file (default master_results_merged.csv); it never overwrites the input CSV.
-
-Run (repo root):  python scripts/merge_results.py [csv_in] [csv_out]
-  csv_in  default <repo>/results/master_results.csv — tolerated missing (from-scratch start)
-  csv_out default <repo>/results/master_results_merged.csv
-
-Provenance: this is the repo edition of the script the paper's tables were merged with. The row
-schema, name regexes, legacy-protocol exclusions and dedup rules are unchanged; the deltas here
-are this docstring, argv/ROOT path plumbing, missing-CSV tolerance, and makedirs for the output dir.
-KNOWN ASYMMETRY (inherited, unchanged): TA rows with seed 42 are hard-skipped, because
-TA-s42 run directories carry no `_s42` infix and name-level dedup cannot tell them apart
-from rows already in csv_in. A from-scratch merge therefore lacks the TA s42 arm unless
-those rows are supplied in csv_in. `analyze_reversal.py` prints the arms and seeds it
-loaded — check that list rather than assuming the grid is complete.
+The input CSV is never overwritten. By default this scans ``incoming/``,
+``checkpoints/*/eval/``, ``results/``, and ``_rev/results/`` and writes
+``results/master_results_merged.csv``. Rows are deduplicated by experiment id.
 """
-import csv, json, glob, os, re, sys
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # repo root (= scripts/..)
-CSV = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, 'results', 'master_results.csv')
-OUT = sys.argv[2] if len(sys.argv) > 2 else os.path.join(ROOT, 'results', 'master_results_merged.csv')
-CKEV = os.path.join(ROOT, 'checkpoints')          # per-run eval JSONs live in <run>/eval/
-OVN = os.path.join(ROOT, 'incoming')              # staging for future remote arrivals
-RES = os.path.join(ROOT, 'results')               # where the README's own eval commands write
-COLS = ['experiment','dataset','model','family','M','rate_pct','train_noise_db','eval_noise_db',
-        'perm_seed','seed','env','miou_fg','mdice_fg','miou','mdice','pa','mpa','source','ckpt_path']
+import csv
+import glob
+import json
+import os
+import re
+import sys
 
-existing = list(csv.DictReader(open(CSV, newline='', encoding='utf-8'))) if os.path.exists(CSV) else []
-seen = {r['experiment'] for r in existing}
-new_rows = []
 
-def pct(m, k):
-    v = m.get(k)
-    return '' if v is None else f'{v*100:.4f}'
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+COLS = [
+    'experiment', 'dataset', 'model', 'family', 'M', 'rate_pct',
+    'train_noise_db', 'eval_noise_db', 'perm_seed', 'seed', 'env',
+    'miou_fg', 'mdice_fg', 'miou', 'mdice', 'pa', 'mpa', 'source',
+    'ckpt_path',
+]
 
-def row(exp, ds, model, family, snr, seed, m, src, ckpt):
-    return {'experiment': exp, 'dataset': ds, 'model': model, 'family': family, 'M': '512',
-            'rate_pct': '3.125', 'train_noise_db': '', 'eval_noise_db': str(snr), 'perm_seed': '',
-            'seed': str(seed), 'env': 'rev2026-07', 'miou_fg': pct(m,'miou_fg'), 'mdice_fg': pct(m,'mdice_fg'),
-            'miou': pct(m,'miou'), 'mdice': pct(m,'mdice'), 'pa': pct(m,'pa'), 'mpa': pct(m,'mpa'),
-            'source': src, 'ckpt_path': ckpt}
 
-# results/ is included because the README's own noise commands write there
-# (`evaluate.py --out_json results/*.json`, `ta_noise_eval.py` -> results/ta_noise/).
-# Entries without a `noise_snr_db` key are skipped below, so unrelated JSONs are inert.
-_paths = (glob.glob(os.path.join(OVN, '**', '*.json'), recursive=True)
-          + glob.glob(os.path.join(CKEV, '*', 'eval', '*.json'))
-          + glob.glob(os.path.join(RES, '**', '*.json'), recursive=True))
-for f in _paths:
-    d = json.load(open(f)); m = d.get('metrics', {})
-    name = d.get('experiment') or d.get('experiment_name') or os.path.basename(f)
-    snr = d.get('noise_snr_db'); src = os.path.basename(f)
-    if snr is None:
-        continue
-    # legacy-protocol exclusions (June-era full-ref noise `_test_acXX`, ns777+ extra-seed batch,
-    # old `_test_snrXX` full-ref): archived in checkpoints/<run>/eval/ but NEVER merged — the live
-    # noise axis is the ac-referenced ns1-3 protocol only (family noise_ac / ta_noise).
-    if re.search(r'_test_ac\d|_ns77\d|_test_snr\d', os.path.basename(f)):
-        continue
-    snr = int(float(snr)); exp = name if name.endswith(('ns1','ns2','ns3')) or '_ns' in name else os.path.basename(f).replace('_test.json','')
-    if exp in seen:
-        continue
-    # image-free: rev_{ds}_{tpls|fcn}[_m512]_s{seed}  (wbc configs carry no m512 in experiment_name)
-    mo = re.match(r'rev_(\w+?)_(tpls|fcn)_(?:m512_)?s(\d+)', name)
-    if mo:
-        ds, model, seed = mo.group(1), mo.group(2), mo.group(3)
-        ckpt = d.get('ckpt') or f'checkpoints/rev_{ds}_{model}_m512_s{seed}'
-        new_rows.append(row(exp, ds, model, 'noise_ac', snr, seed, m, src, ckpt)); seen.add(exp); continue
-    # TA seed: ta_{ds}_{hsi|cs}_s{seed}_snr…  (skip s42: already in master CSV -> avoid double-count)
-    mo = re.match(r'ta_(\w+?)_(hsi|cs)_s(\d+)_snr', name)
-    if mo:
-        ds, meth, seed = mo.group(1), mo.group(2), mo.group(3)
-        if seed == '42':
+def pct(metrics, key):
+    value = metrics.get(key)
+    return '' if value is None else f'{value * 100:.4f}'
+
+
+def _base_row(experiment, dataset, model, family, metrics, source, ckpt,
+              bucket_size=512, seed='', eval_noise_db='', train_noise_db='',
+              perm_seed='', environment='review2026-07'):
+    rate = 100.0 * int(bucket_size) / (128 * 128)
+    return {
+        'experiment': experiment,
+        'dataset': dataset,
+        'model': model,
+        'family': family,
+        'M': str(bucket_size),
+        'rate_pct': f'{rate:.4f}'.rstrip('0').rstrip('.'),
+        'train_noise_db': str(train_noise_db),
+        'eval_noise_db': str(eval_noise_db),
+        'perm_seed': str(perm_seed) if perm_seed is not None else '',
+        'seed': str(seed),
+        'env': environment,
+        'miou_fg': pct(metrics, 'miou_fg'),
+        'mdice_fg': pct(metrics, 'mdice_fg'),
+        'miou': pct(metrics, 'miou'),
+        'mdice': pct(metrics, 'mdice'),
+        'pa': pct(metrics, 'pa'),
+        'mpa': pct(metrics, 'mpa'),
+        'source': source,
+        'ckpt_path': ckpt,
+    }
+
+
+def clean_eval_row(data, source):
+    """Map a released clean-evaluation JSON to one CSV row, or return None."""
+    metrics = data.get('metrics')
+    if not isinstance(metrics, dict) or data.get('noise_snr_db') is not None:
+        return None
+
+    source_stem = os.path.splitext(os.path.basename(source))[0]
+    source_stem = re.sub(r'_test$', '', source_stem)
+    declared = data.get('experiment') or data.get('experiment_name') or ''
+    experiment = source_stem if re.search(r'_s\d+', source_stem) else declared
+    experiment = experiment or source_stem
+
+    patterns = [
+        (r'^rev_(\w+?)_(traditional|fcn|no_aux|fixed|tpls)(?:_m\d+)?(?:_s\d+)?$', 'main_clean'),
+        (r'^lift_(\w+?)_(\w+?)(?:_s\d+)?$', 'lift_ablation_clean'),
+        (r'^recon_(\w+?)_(tradgi|admm-l1)(?:_s\d+)?$', 'reconstruction_clean'),
+        (r'^ta_(\w+?)_(hsi|cs)(?:_\w+)?(?:_s\d+)?$', 'task_adapted_clean'),
+    ]
+    match = family = None
+    for regex, candidate_family in patterns:
+        match = re.match(regex, experiment)
+        if match:
+            family = candidate_family
+            break
+    if match is None:
+        return None
+
+    dataset, model_token = match.group(1), match.group(2)
+    if family == 'lift_ablation_clean':
+        model = f'lift_{model_token}'
+    elif family == 'task_adapted_clean':
+        model = f'ta_{model_token}'
+    else:
+        model = model_token
+
+    seed_match = re.search(r'_s(\d+)', experiment)
+    seed = data.get('train_seed', seed_match.group(1) if seed_match else '')
+    m_match = re.search(r'_m(\d+)', experiment)
+    bucket_size = data.get('bucket_size') or (int(m_match.group(1)) if m_match else 512)
+    return _base_row(
+        experiment, data.get('dataset') or dataset, model, family, metrics,
+        os.path.basename(source), data.get('ckpt', ''), bucket_size=bucket_size,
+        seed=seed, perm_seed=data.get('perm_seed'),
+    )
+
+
+def noise_eval_row(data, source):
+    """Map a supported AC-referenced noise JSON to one row, or return None."""
+    metrics = data.get('metrics')
+    snr = data.get('noise_snr_db')
+    if not isinstance(metrics, dict) or snr is None:
+        return None
+    basename = os.path.basename(source)
+    if re.search(r'_test_ac\d|_ns77\d|_test_snr\d', basename):
+        return None
+
+    name = data.get('experiment') or data.get('experiment_name') or basename
+    snr = int(float(snr))
+    experiment = (name if name.endswith(('ns1', 'ns2', 'ns3')) or '_ns' in name
+                  else basename.replace('_test.json', ''))
+
+    match = re.match(r'rev_(\w+?)_(tpls|fcn)_(?:m512_)?s(\d+)', name)
+    if match:
+        dataset, model, seed = match.groups()
+        ckpt = data.get('ckpt') or f'checkpoints/rev_{dataset}_{model}_m512_s{seed}'
+        return _base_row(experiment, dataset, model, 'noise_ac', metrics, basename,
+                         ckpt, seed=seed, eval_noise_db=snr, environment='rev2026-07')
+
+    match = re.match(r'ta_(\w+?)_(hsi|cs)_s(\d+)_snr', name)
+    if match:
+        dataset, method, seed = match.groups()
+        if seed == '42':  # legacy master CSV already owns this arm
+            return None
+        return _base_row(experiment, dataset, f'ta_{method}', 'ta_noise', metrics,
+                         basename, f'checkpoints/ta_{dataset}_{method}_s{seed}',
+                         seed=seed, eval_noise_db=snr, environment='rev2026-07')
+
+    match = re.match(r'ta_(\w+?)_hsi_(naug20|naugmix)_snr', name)
+    if match:
+        dataset, tag = match.groups()
+        return _base_row(experiment, dataset, f'ta_hsi_{tag}', 'ta_noise_naug',
+                         metrics, basename, f'checkpoints/ta_{dataset}_hsi_{tag}',
+                         seed=42, eval_noise_db=snr, environment='rev2026-07')
+    return None
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    csv_in = argv[0] if argv else os.path.join(ROOT, 'results', 'master_results.csv')
+    csv_out = argv[1] if len(argv) > 1 else os.path.join(ROOT, 'results', 'master_results_merged.csv')
+
+    existing = []
+    if os.path.exists(csv_in):
+        with open(csv_in, newline='', encoding='utf-8') as handle:
+            existing = list(csv.DictReader(handle))
+    seen = {row['experiment'] for row in existing}
+
+    paths = (
+        glob.glob(os.path.join(ROOT, 'incoming', '**', '*.json'), recursive=True)
+        + glob.glob(os.path.join(ROOT, 'checkpoints', '*', 'eval', '*.json'))
+        + glob.glob(os.path.join(ROOT, 'results', '**', '*.json'), recursive=True)
+        + glob.glob(os.path.join(ROOT, '_rev', 'results', '**', '*.json'), recursive=True)
+    )
+    new_rows = []
+    for path in sorted(set(paths)):
+        try:
+            with open(path, encoding='utf-8') as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError):
             continue
-        new_rows.append(row(exp, ds, f'ta_{meth}', 'ta_noise', snr, seed, m, src, f'checkpoints/ta_{ds}_{meth}_s{seed}')); seen.add(exp); continue
-    # naug: ta_{ds}_hsi_{naug20|naugmix}_snr…
-    mo = re.match(r'ta_(\w+?)_hsi_(naug20|naugmix)_snr', name)
-    if mo:
-        ds, tag = mo.group(1), mo.group(2)
-        new_rows.append(row(exp, ds, f'ta_hsi_{tag}', 'ta_noise_naug', snr, 42, m, src, f'checkpoints/ta_{ds}_hsi_{tag}')); seen.add(exp); continue
+        merged = noise_eval_row(data, path) or clean_eval_row(data, path)
+        if merged is None or merged['experiment'] in seen:
+            continue
+        new_rows.append(merged)
+        seen.add(merged['experiment'])
 
-allrows = existing + new_rows
-os.makedirs(os.path.dirname(OUT), exist_ok=True)
-with open(OUT, 'w', newline='', encoding='utf-8') as f:
-    w = csv.DictWriter(f, fieldnames=COLS); w.writeheader()
-    for r in allrows:
-        w.writerow({c: r.get(c, '') for c in COLS})
-print(f'existing={len(existing)}  new={len(new_rows)}  total={len(allrows)}')
-fam = {}
-for r in new_rows: fam[r['family']] = fam.get(r['family'], 0) + 1
-print('new by family:', fam)
-print('wrote', OUT)
+    all_rows = existing + new_rows
+    os.makedirs(os.path.dirname(os.path.abspath(csv_out)), exist_ok=True)
+    with open(csv_out, 'w', newline='', encoding='utf-8') as handle:
+        writer = csv.DictWriter(handle, fieldnames=COLS)
+        writer.writeheader()
+        for merged in all_rows:
+            writer.writerow({column: merged.get(column, '') for column in COLS})
+
+    families = {}
+    for merged in new_rows:
+        families[merged['family']] = families.get(merged['family'], 0) + 1
+    print(f'existing={len(existing)}  new={len(new_rows)}  total={len(all_rows)}')
+    print('new by family:', families)
+    print('wrote', csv_out)
+
+
+if __name__ == '__main__':
+    main()

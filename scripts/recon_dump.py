@@ -10,7 +10,8 @@ Independent of any segmentation checkpoint: for every image of the given dataset
        binary=0/255, multi-class=evenly spaced gray levels 0/128/255, matching the data_rev mask encoding, so
        FolderSegDataset('custom') / WBCDataset('wbc') can read them straight back).
 
-Idempotent: skipped when images+masks both exist already; PNGs are written atomically (tmp+replace), an interrupt leaves no half-written file.
+Idempotent only after a complete hash inventory validates. Partial runs are rewritten;
+PNGs are written atomically (tmp+replace), so an interrupt leaves no half-written file.
 
 Usage (from the repository root, PYTHONPATH=repository root):
     python scripts/recon_dump.py --dataset carvana --split test --method hsi --limit 8
@@ -18,8 +19,11 @@ Usage (from the repository root, PYTHONPATH=repository root):
 """
 
 import argparse
+import hashlib
+import inspect
 import json
 import logging
+import math
 import os
 from pathlib import Path
 
@@ -30,6 +34,11 @@ from PIL import Image
 from src.datasets.dataset_factory import get_dataset
 from src.reconstruction import trad_gi_recon, admm_l1_recon
 from src.utils.ghost_patterns import get_hadamard_matrix
+from src.utils.reconstruction_manifest import (
+    build_reconstruction_inventory,
+    inventory_sha256,
+    validate_reconstruction_manifest,
+)
 
 # dataset metadata, matching configs/experiments/rev_*_traditional.yaml
 DATASET_META = {
@@ -41,7 +50,10 @@ DATASET_META = {
 
 def to_uint8_gray(arr01):
     """float [0,1] -> uint8 grayscale (same logic as to_uint8_gray in scripts/reconstruct_eval.py)"""
-    arr = np.clip(arr01, 0.0, 1.0)
+    arr = np.asarray(arr01)
+    if not np.isfinite(arr).all():
+        raise FloatingPointError("reconstruction contains NaN or Inf; refusing to publish a PNG")
+    arr = np.clip(arr, 0.0, 1.0)
     return (arr * 255.0 + 0.5).astype(np.uint8)
 
 
@@ -52,12 +64,98 @@ def save_png_atomic(u8_hw, path: Path):
     os.replace(tmp, path)
 
 
+def write_json_atomic(payload, path: Path):
+    """Atomically publish a JSON manifest."""
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False, sort_keys=True)
+        f.write('\n')
+    os.replace(tmp, path)
+
+
+def generation_signature(generation):
+    """Stable digest covering every setting that can change dumped pixels."""
+    encoded = json.dumps(
+        generation, sort_keys=True, separators=(',', ':'), ensure_ascii=False,
+    ).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_existing_generation(meta_path: Path, has_outputs, expected_signature):
+    """Reject legacy or differently generated outputs instead of mixing them."""
+    if not meta_path.exists():
+        if has_outputs:
+            raise RuntimeError(
+                f"Found reconstruction PNGs under {meta_path.parent} but no generation "
+                "manifest. Refusing to mix legacy/unverified outputs; use a new --out_root "
+                "or remove the old output directory after reviewing it."
+            )
+        return None
+
+    try:
+        with open(meta_path, 'r', encoding='utf-8') as f:
+            previous = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Cannot validate existing generation manifest {meta_path}: {exc}") from exc
+
+    actual = previous.get('generation_signature')
+    if actual != expected_signature:
+        raise RuntimeError(
+            f"Existing output generation signature does not match this run "
+            f"(existing={actual or 'missing'}, requested={expected_signature}). "
+            "Refusing to create a stale/mixed dataset; use a new --out_root or remove "
+            "the reviewed old output directory."
+        )
+    return previous
+
+
 def sample_stem(dataset, idx):
     """folder-style datasets -> the image file stem; MNIST (samples are torchvision indices) -> mnist_<idx:05d>"""
     entry = dataset.samples[idx]
     if isinstance(entry, (tuple, list)) and hasattr(entry[0], 'stem'):
         return entry[0].stem
     return f"mnist_{int(entry):05d}"
+
+
+def update_source_content_hash(hasher, dataset, idx):
+    """Hash the source bytes (or decoded sample) so same-name edits invalidate a dump."""
+    entry = dataset.samples[idx]
+    paths = []
+    if isinstance(entry, (tuple, list)):
+        paths = [Path(value) for value in entry if isinstance(value, (str, os.PathLike))]
+    if paths and all(path.is_file() for path in paths):
+        for path in paths:
+            hasher.update(path.name.encode('utf-8'))
+            with open(path, 'rb') as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                    hasher.update(chunk)
+        return
+
+    # Index-backed datasets such as MNIST have no per-sample source path.
+    image, mask = dataset._load_pair(idx)
+    for value in (image, mask):
+        array = np.asarray(value)
+        hasher.update(str(array.shape).encode('ascii'))
+        hasher.update(str(array.dtype).encode('ascii'))
+        hasher.update(array.tobytes(order='C'))
+
+
+def implementation_fingerprint(dataset):
+    """Hash the local implementation files that participate in pixel generation."""
+    files = {
+        Path(__file__).resolve(),
+        Path(inspect.getfile(get_hadamard_matrix)).resolve(),
+        Path(inspect.getfile(trad_gi_recon)).resolve(),
+        Path(inspect.getfile(admm_l1_recon)).resolve(),
+    }
+    for cls in dataset.__class__.__mro__:
+        if cls is not object:
+            files.add(Path(inspect.getfile(cls)).resolve())
+    digest = hashlib.sha256()
+    for path in sorted(files, key=str):
+        digest.update(path.name.encode('utf-8'))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
 
 
 def encode_mask_png(mask_idx_hw, num_classes):
@@ -111,15 +209,35 @@ def main():
     parser.add_argument('--noise_seed', type=int, default=0)
     args = parser.parse_args()
 
+    if args.noise_mixed and args.noise_snr_db is not None:
+        parser.error('--noise_mixed and --noise_snr_db are mutually exclusive')
+    finite_values = {
+        '--cs_l1_weight': args.cs_l1_weight,
+        '--cs_rho': args.cs_rho,
+        '--noise_mixed_lo': args.noise_mixed_lo,
+        '--noise_mixed_hi': args.noise_mixed_hi,
+    }
+    if args.noise_snr_db is not None:
+        finite_values['--noise_snr_db'] = args.noise_snr_db
+    for label, value in finite_values.items():
+        if not math.isfinite(value):
+            parser.error(f'{label} must be finite')
+    if args.batch_size <= 0 or args.cs_steps <= 0:
+        parser.error('--batch_size and --cs_steps must be positive')
+    if args.cs_l1_weight < 0 or args.cs_rho <= 0:
+        parser.error('--cs_l1_weight must be non-negative and --cs_rho must be positive')
+    if args.noise_mixed_lo > args.noise_mixed_hi:
+        parser.error('--noise_mixed_lo must be <= --noise_mixed_hi')
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     device = torch.device(args.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
-    _noise_rng = np.random.default_rng(args.noise_seed)
-
     meta = DATASET_META[args.dataset]
     data_root = args.data_root or meta['root']
     num_classes = meta['classes']
     N = args.img_size * args.img_size
     M = args.bucket_size
+    if not 0 < M <= N:
+        parser.error(f'--bucket_size must be in [1, {N}], got {M}')
     logging.info(f"dataset={args.dataset} split={args.split} method={args.method} "
                  f"M={M}/{N} ({M / N:.2%}) device={device}")
 
@@ -143,54 +261,126 @@ def main():
     img_dir.mkdir(parents=True, exist_ok=True)
     msk_dir.mkdir(parents=True, exist_ok=True)
 
-    # measurement matrix: hsi takes the full (N,N) (inverse transform at the reconstruction end), cs takes (M,N) (the same first M rows as the bucket)
-    if args.method == 'hsi':
-        patterns = get_hadamard_matrix(N, N)
+    total = len(dataset)
+    sample_hasher = hashlib.sha256()
+    source_content_hasher = hashlib.sha256()
+    for idx in range(total):
+        sample_hasher.update(f"{idx}\0{sample_stem(dataset, idx)}\n".encode('utf-8'))
+        update_source_content_hash(source_content_hasher, dataset, idx)
+
+    if args.noise_mixed:
+        noise_config = {
+            'mode': 'mixed_uniform_db', 'lo_db': args.noise_mixed_lo,
+            'hi_db': args.noise_mixed_hi, 'seed': args.noise_seed,
+        }
+    elif args.noise_snr_db is not None:
+        noise_config = {
+            'mode': 'fixed_db', 'snr_db': args.noise_snr_db, 'seed': args.noise_seed,
+        }
     else:
-        patterns = get_hadamard_matrix(N, M)
+        noise_config = {'mode': 'clean'}
 
     cs_args = {'l1_weight': args.cs_l1_weight, 'rho': args.cs_rho, 'steps': args.cs_steps}
+    generation = {
+        'schema_version': 3,
+        'dataset': args.dataset,
+        'split': args.split,
+        'method': args.method,
+        'source_root': str(Path(data_root).resolve()),
+        'source_sample_count': total,
+        'source_sample_ids_sha256': sample_hasher.hexdigest(),
+        'source_content_sha256': source_content_hasher.hexdigest(),
+        'implementation_sha256': implementation_fingerprint(dataset),
+        'bucket_size': M,
+        'img_size': args.img_size,
+        'phi': 'sylvester_natural_first_M_rows',
+        'cs_params': cs_args if args.method == 'cs' else None,
+        'num_classes': num_classes,
+        'mask_encoding': '0/255' if num_classes <= 1 else
+                         f"levels={np.rint(np.linspace(0, 255, num_classes)).astype(int).tolist()}",
+        'noise': noise_config,
+        'reconstruction_batch_size': args.batch_size,
+        'device': str(device),
+        'torch_version': torch.__version__,
+        'numpy_version': np.__version__,
+    }
+    signature = generation_signature(generation)
+    meta_path = out_split / '_dump_meta.json'
+    has_outputs = any(img_dir.glob('*.png')) or any(msk_dir.glob('*.png'))
+    previous = validate_existing_generation(meta_path, has_outputs, signature)
+    if previous is not None and previous.get('complete') is True:
+        validate_reconstruction_manifest(out_split, expected_signature=signature)
+        logging.info(f"verified complete reconstruction dump -> {out_split}")
+        return
+    if previous is not None and has_outputs:
+        logging.warning(
+            "A matching but incomplete dump exists; every selected pair will be rewritten."
+        )
 
-    total = len(dataset)
+    # Publish the signature before the first PNG. A killed run can only be resumed
+    # with an identical generation contract.
+    write_json_atomic({
+        'generation_signature': signature,
+        'generation': generation,
+        'complete': False,
+        'status': 'in_progress',
+    }, meta_path)
+
+    # Both HSI (adjoint) and CS use exactly the acquired first M Hadamard rows.
+    patterns = get_hadamard_matrix(N, M)
+
     n_take = min(total, args.limit) if args.limit > 0 else total
     logging.info(f"split holds {total} images, processing the first {n_take} this run -> {out_split}")
 
     dumped, skipped = 0, 0
-    pending = []  # (stem, bucket_raw(M,), mask_idx(H,W))
+    pending = []  # (dataset index, stem, bucket_raw(M,), mask_idx(H,W))
 
     def flush():
         nonlocal dumped
         if not pending:
             return
-        buckets = np.stack([b for _, b, _ in pending]).astype(np.float32)  # (B, M)
+        buckets = np.stack([b for _, _, b, _ in pending]).astype(np.float32)  # (B, M)
         if args.noise_mixed or args.noise_snr_db is not None:
-            ref = buckets[:, 1:]  # AC-ref (exclude DC), matches evaluate.py / ta_noise_eval convention
-            if args.noise_mixed:
-                snr = _noise_rng.uniform(args.noise_mixed_lo, args.noise_mixed_hi, size=(buckets.shape[0], 1))
-            else:
-                snr = args.noise_snr_db
-            sigma = ref.std(axis=1, keepdims=True) * (10.0 ** (-snr / 20.0))
-            buckets = (buckets + sigma * _noise_rng.standard_normal(buckets.shape)).astype(np.float32)
+            # Derive an independent RNG stream from the dataset index. This makes
+            # noisy output invariant to batch size, skips, and interrupted resumes.
+            for row, (sample_idx, _, _, _) in enumerate(pending):
+                sample_rng = np.random.default_rng(
+                    np.random.SeedSequence([args.noise_seed, sample_idx])
+                )
+                snr = (sample_rng.uniform(args.noise_mixed_lo, args.noise_mixed_hi)
+                       if args.noise_mixed else args.noise_snr_db)
+                ref_std = buckets[row, 1:].std()
+                sigma = ref_std * (10.0 ** (-snr / 20.0))
+                buckets[row] += sigma * sample_rng.standard_normal(buckets.shape[1])
         recon = reconstruct_batch(args.method, buckets, args.img_size, patterns, device, cs_args)
-        for (stem, _, mask_idx), rec in zip(pending, recon):
+        for (_, stem, _, mask_idx), rec in zip(pending, recon):
             save_png_atomic(to_uint8_gray(rec[0]), img_dir / f"{stem}.png")
             save_png_atomic(encode_mask_png(mask_idx, num_classes), msk_dir / f"{stem}.png")
             dumped += 1
-        logging.info(f"  dumped {dumped}/{n_take - skipped} (skipped {skipped})")
+        logging.info(f"  dumped {dumped}/{n_take}")
         pending.clear()
 
     for idx in range(n_take):
         stem = sample_stem(dataset, idx)
-        if (img_dir / f"{stem}.png").exists() and (msk_dir / f"{stem}.png").exists():
-            skipped += 1
-            continue
         sample = dataset[idx]  # bucket_raw = Φ @ image (CPU path, noise-free, no augmentation, deterministic)
-        pending.append((stem, sample['bucket_raw'], sample['mask']))
+        pending.append((idx, stem, sample['bucket_raw'], sample['mask']))
         if len(pending) >= args.batch_size:
             flush()
     flush()
 
+    inventory = build_reconstruction_inventory(out_split)
+    if n_take == total:
+        expected_stems = [sample_stem(dataset, idx) for idx in range(total)]
+        actual_stems = [entry['stem'] for entry in inventory]
+        if len(expected_stems) != len(set(expected_stems)) or actual_stems != sorted(expected_stems):
+            raise RuntimeError(
+                "complete reconstruction inventory does not exactly match source sample stems"
+            )
     meta_out = {
+        'generation_signature': signature,
+        'generation': generation,
+        'complete': n_take == total,
+        'status': 'complete' if n_take == total else 'partial_limit',
         'dataset': args.dataset, 'split': args.split, 'method': args.method,
         'bucket_size': M, 'img_size': args.img_size, 'sampling_rate': M / N,
         'phi': 'sylvester_natural_first_M_rows (get_hadamard_matrix)',
@@ -200,10 +390,14 @@ def main():
                          f"levels={np.rint(np.linspace(0, 255, num_classes)).astype(int).tolist()}",
         'total_in_split': total, 'processed': n_take,
         'dumped_this_run': dumped, 'skipped_existing': skipped,
+        'pair_count': len(inventory), 'file_count': 2 * len(inventory),
+        'inventory_sha256': inventory_sha256(inventory),
+        'inventory': inventory,
     }
-    with open(out_split / '_dump_meta.json', 'w', encoding='utf-8') as f:
-        json.dump(meta_out, f, indent=2, ensure_ascii=False)
-    logging.info(f"done: {dumped} new, {skipped} skipped. meta -> {out_split / '_dump_meta.json'}")
+    write_json_atomic(meta_out, meta_path)
+    if n_take == total:
+        validate_reconstruction_manifest(out_split, expected_signature=signature)
+    logging.info(f"done: {dumped} new, {skipped} skipped. meta -> {meta_path}")
 
 
 if __name__ == '__main__':

@@ -1,5 +1,6 @@
 import argparse
 import logging
+import re
 from pathlib import Path
 import numpy as np
 import torch
@@ -10,6 +11,7 @@ from src.utils.config_parser import load_config
 from src.datasets.dataset_factory import get_dataset
 import src.models as models
 from src.metrics.segmentation_metrics import batch_segmentation_metrics
+from src.utils.checkpoint import load_checkpoint
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -28,19 +30,16 @@ def main():
                         help="reference for the SNR sigma: full=std over the whole sequence (historical behaviour), ac=AC std after dropping the DC row (comparable across datasets)")
     parser.add_argument('--noise_seed', type=int, default=None,
                         help='random seed for the evaluation noise (seeds the draw when not None, making the noise reproducible; several seeds give the error bars)')
+    parser.add_argument('--allow_unsafe_pickle', action='store_true',
+                        help='allow weights_only=False only for a checkpoint you independently trust')
     args = parser.parse_args()
 
     if args.noise_seed is not None:
         torch.manual_seed(args.noise_seed)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    # safe loader first; full training checkpoints embed a config dict, so fall back only for files you trust.
-    try:
-        ckpt = torch.load(args.ckpt_path, map_location=device, weights_only=True)
-    except Exception:
-        import warnings
-        warnings.warn("weights_only=True failed; falling back to a full (unsafe pickle) load. Only load checkpoints from a source you trust.")
-        ckpt = torch.load(args.ckpt_path, map_location=device, weights_only=False)
+    ckpt = load_checkpoint(
+        args.ckpt_path, map_location=device, allow_unsafe_pickle=args.allow_unsafe_pickle)
     cfg = ckpt['config']
     bucket_on_gpu = bool(cfg['data'].get('bucket_on_gpu', False))
 
@@ -54,6 +53,10 @@ def main():
             f"different acquisition order than training. Set data.bucket_on_gpu: true.")
 
     base_root = str(Path(cfg['data']['train_dir']).parent)
+    require_reconstruction_manifest = bool(
+        cfg['data'].get('require_reconstruction_manifest', False)
+        or str(cfg['training'].get('experiment_name', '')).startswith('ta_')
+    )
     val_set = get_dataset(
         cfg['data']['dataset'],
         root_dir=base_root,
@@ -64,7 +67,8 @@ def main():
         preload=False,
         augmentation=None,
         transform=None,
-        compute_bucket=not bucket_on_gpu
+        compute_bucket=not bucket_on_gpu,
+        require_reconstruction_manifest=require_reconstruction_manifest,
     )
     val_loader = DataLoader(
         val_set,
@@ -203,13 +207,24 @@ def main():
         import json
         outp = Path(args.out_json)
         outp.parent.mkdir(parents=True, exist_ok=True)
+        experiment_name = cfg['training'].get('experiment_name', '')
+        seed_match = re.search(r'_s(\d+)$', experiment_name)
+        if seed_match is None:
+            seed_match = re.search(r'_s(\d+)', str(args.ckpt_path))
+        train_seed = ckpt.get('seed')
+        if train_seed is None and seed_match is not None:
+            train_seed = int(seed_match.group(1))
         with open(outp, 'w') as f:
             json.dump({
                 'ckpt': args.ckpt_path,
                 'split': args.split,
-                'experiment_name': cfg['training'].get('experiment_name', ''),
+                'experiment_name': experiment_name,
                 'model': cfg['model']['name'],
                 'dataset': cfg['data']['dataset'],
+                'bucket_size': cfg['data']['bucket_size'],
+                'sampling_rate': cfg['data']['bucket_size'] / (cfg['data']['img_size'] ** 2),
+                'train_seed': train_seed,
+                'samples': int(P.shape[0]),
                 'noise_snr_db': args.noise_snr_db,
                 'noise_ref': args.noise_ref,
                 'noise_seed': args.noise_seed,
