@@ -344,6 +344,74 @@ def test_grouped_split_is_deterministic_and_car_disjoint():
     assert sum(map(len, first)) == len(pairs)
 
 
+def test_wbc_legacy_collision_resolution_is_explicit_last_write_wins(tmp_path):
+    first = (
+        tmp_path / 'Dataset 1' / '001.bmp',
+        tmp_path / 'Dataset 1' / '001.png',
+    )
+    second = (
+        tmp_path / 'Dataset 2' / '001.bmp',
+        tmp_path / 'Dataset 2' / '001.png',
+    )
+    preparer = SegmentationDatasetPreparer.__new__(SegmentationDatasetPreparer)
+    selected, events = preparer._resolve_wbc_legacy_collisions([first, second])
+
+    assert selected == [second]
+    assert events == [(first, second)]
+
+
+def test_wbc_protocols_record_actual_counts_and_full_v2_keeps_all_pairs(tmp_path):
+    wbc_root = tmp_path / 'wbc' / 'raw' / 'segmentation_WBC-master'
+    for dataset_index in (1, 2):
+        source = wbc_root / f'Dataset {dataset_index}'
+        source.mkdir(parents=True)
+        for sample_index in range(20):
+            value = (dataset_index - 1) * 20 + sample_index
+            Image.fromarray(np.full((2, 2), value, dtype=np.uint8)).save(
+                source / f'{sample_index:03d}.bmp')
+            Image.fromarray(np.full((2, 2), value + 80, dtype=np.uint8)).save(
+                source / f'{sample_index:03d}.png')
+
+    preparer = SegmentationDatasetPreparer(tmp_path)
+    assert preparer.prepare_dataset(
+        'wbc', force=True, wbc_protocol='paper-legacy-v1')
+    legacy_info = json.loads(
+        (tmp_path / 'wbc' / 'dataset_info.json').read_text(encoding='utf-8'))
+    legacy_counts = {
+        split: len(list((tmp_path / 'wbc' / split / 'images').iterdir()))
+        for split in ('train', 'val', 'test')
+    }
+    assert legacy_info['protocol_id'] == 'paper-legacy-v1'
+    assert legacy_info['raw_pair_count'] == 40
+    assert legacy_info['prepared_pair_count'] == sum(legacy_counts.values())
+    assert legacy_info['prepared_pair_count'] + legacy_info['excluded_collision_pair_count'] == 40
+    assert legacy_info['train_samples'] == legacy_counts['train']
+    assert legacy_info['val_samples'] == legacy_counts['val']
+    assert legacy_info['test_samples'] == legacy_counts['test']
+    assert all(value == 0 for value in legacy_info['cross_split_overlap_counts'].values())
+
+    # Protocol changes are never guessed or mixed into an existing prepared tree.
+    assert not preparer.prepare_dataset('wbc', wbc_protocol='full-v2')
+    unchanged = json.loads(
+        (tmp_path / 'wbc' / 'dataset_info.json').read_text(encoding='utf-8'))
+    assert unchanged['protocol_id'] == 'paper-legacy-v1'
+
+    assert preparer.prepare_dataset('wbc', force=True, wbc_protocol='full-v2')
+    full_info = json.loads(
+        (tmp_path / 'wbc' / 'dataset_info.json').read_text(encoding='utf-8'))
+    full_images = [
+        path
+        for split in ('train', 'val', 'test')
+        for path in (tmp_path / 'wbc' / split / 'images').iterdir()
+    ]
+    assert full_info['protocol_id'] == 'full-v2'
+    assert full_info['prepared_pair_count'] == 40
+    assert full_info['excluded_collision_pair_count'] == 0
+    assert (full_info['train_samples'], full_info['val_samples'], full_info['test_samples']) == (28, 6, 6)
+    assert len({path.name.casefold() for path in full_images}) == 40
+    assert all('__' in path.name for path in full_images)
+
+
 def test_merge_results_accepts_clean_eval_json():
     data = {
         'experiment_name': 'rev_carvana_tpls',

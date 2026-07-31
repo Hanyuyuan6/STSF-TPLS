@@ -62,10 +62,23 @@ Place the archives under `data_rev/<dataset>/raw/` (the experiment configs read 
 then build the group-disjoint / sample-disjoint train/val/test splits:
 ```bash
 python -m scripts.prepare_seg_datasets --dataset carvana --data_root data_rev
-python -m scripts.prepare_seg_datasets --dataset wbc     --data_root data_rev
+python -m scripts.prepare_seg_datasets --dataset wbc --data_root data_rev \
+    --wbc_protocol paper-legacy-v1
 ```
 Carvana is split by vehicle ID (seeded, with a hard disjointness assertion) so the same car
 never appears in two splits.
+
+The paper and released WBC checkpoints use the explicit **`paper-legacy-v1`** protocol. It
+reproduces the historical deterministic sample selection exactly: the 400 upstream pairs first
+receive the seeded nominal 280/60/60 assignment, then duplicate output basenames are resolved with
+the historical last-write-wins rule *before copying*, leaving the actual **231/58/60** train/val/test
+sets. `dataset_info.json` records these actual counts, while `wbc_split_manifest.json` records every
+kept source identity and image/mask SHA-256 and verifies cross-split disjointness.
+
+For new experiments only, `--wbc_protocol full-v2 --force` gives every raw pair a collision-safe
+name and keeps all 400 samples (280/60/60). `full-v2` is a different data protocol and is not linked
+to the paper metrics or public checkpoints. Changing an existing prepared WBC tree requires
+`--force`; otherwise the preparer fails rather than mixing or guessing protocols.
 
 ## Pretrained weights
 The ten STSF+TPLS checkpoints behind the paper's main comparison (three datasets × three seeds, plus
@@ -74,11 +87,12 @@ scheduler state stripped, 147.6 MB each, loadable under `weights_only=True`:
 ```bash
 pip install huggingface_hub          # provides the `hf` CLI; kept out of requirements.txt
 hf download hanyuyuan/STSF-TPLS-weights checkpoints/rev_carvana_tpls_s42/best.pth \
-    --revision v1.0.0 --local-dir .
+    --revision 22a6e8ee71212ed4574b1a35a5c27e0681219dba --local-dir .
 python -m scripts.evaluate --ckpt_path checkpoints/rev_carvana_tpls_s42/best.pth --split test
 ```
 [hanyuyuan/STSF-TPLS-weights](https://huggingface.co/hanyuyuan/STSF-TPLS-weights) lists every file with
 its exact byte count, Git LFS SHA-256 object ID, legacy MD5, and clean test foreground mIoU.
+The download above uses a real immutable Hugging Face commit because no release tag exists.
 Training from scratch needs no download.
 
 ## Running the experiments

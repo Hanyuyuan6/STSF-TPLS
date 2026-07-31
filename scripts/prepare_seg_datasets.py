@@ -1,10 +1,12 @@
 import argparse
+import hashlib
 import logging
 from pathlib import Path
 import shutil
 import random
 from typing import Tuple, List
 import json
+import tempfile
 import zipfile
 import tarfile
 import gzip
@@ -20,6 +22,8 @@ class SegmentationDatasetPreparer:
     """
     Segmentation dataset preparation script: extracts archives automatically, lays out the data structure, supports VOC.
     """
+    WBC_PROTOCOLS = ('paper-legacy-v1', 'full-v2')
+
     def __init__(self, data_root: str = './data'):
         self.data_root = Path(data_root)  # path of the data root directory
         self.data_root.mkdir(parents=True, exist_ok=True)  # make sure the data root exists
@@ -114,20 +118,79 @@ class SegmentationDatasetPreparer:
                     'test/images', 'test/masks']:
             (dataset_dir / sub).mkdir(parents=True, exist_ok=True)
 
-    # Copy the image and mask file pairs into the train or val split directory
-    def _copy_pairs_to_split(self, pairs: List[Tuple[Path, Path]], split_dir: Path):
+    # Copy image/mask pairs without ever allowing two sources to share a destination filename.
+    def _copy_pairs_to_split(self, pairs: List[Tuple[Path, Path]], split_dir: Path,
+                             output_names=None):
         img_dir = split_dir / 'images'
         mask_dir = split_dir / 'masks'
         img_dir.mkdir(parents=True, exist_ok=True)
         mask_dir.mkdir(parents=True, exist_ok=True)
-        for img_path, mask_path in tqdm(pairs, desc=f"Copying to {split_dir.name}"):
-            shutil.copy2(img_path, img_dir / img_path.name)
-            shutil.copy2(mask_path, mask_dir / (img_path.stem + Path(mask_path).suffix))
+        planned = []
+        seen_images, seen_masks = set(), set()
+        for img_path, mask_path in pairs:
+            if output_names is None:
+                img_name = img_path.name
+                mask_name = img_path.stem + mask_path.suffix
+            else:
+                img_name, mask_name = output_names(img_path, mask_path)
+            if Path(img_name).name != img_name or Path(mask_name).name != mask_name:
+                raise ValueError("prepared output names must be plain filenames")
+            image_key, mask_key = img_name.casefold(), mask_name.casefold()
+            if image_key in seen_images or mask_key in seen_masks:
+                raise ValueError(
+                    f"destination filename collision in {split_dir.name}: "
+                    f"{img_name} / {mask_name}"
+                )
+            seen_images.add(image_key)
+            seen_masks.add(mask_key)
+            planned.append((img_path, mask_path, img_name, mask_name))
+
+        for img_path, mask_path, img_name, mask_name in tqdm(
+                planned, desc=f"Copying to {split_dir.name}"):
+            shutil.copy2(img_path, img_dir / img_name)
+            shutil.copy2(mask_path, mask_dir / mask_name)
+        return planned
 
     # Save the dataset info to a json file
     def _save_dataset_info(self, dataset_dir: Path, info: dict):
-        with open(dataset_dir / 'dataset_info.json', 'w') as f:
-            json.dump(info, f, indent=2)
+        self._save_json(dataset_dir / 'dataset_info.json', info)
+
+    @staticmethod
+    def _save_json(path: Path, payload: dict):
+        """Write metadata atomically so an interrupted run cannot leave truncated JSON."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + '.tmp')
+        with open(temporary, 'w', encoding='utf-8', newline='\n') as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+            f.write('\n')
+        temporary.replace(path)
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with open(path, 'rb') as f:
+            for block in iter(lambda: f.read(1024 * 1024), b''):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def _wbc_protocol_ready(self, dataset_dir: Path, protocol_id: str) -> bool:
+        """Require explicit protocol metadata and counts that match files on disk."""
+        info_path = dataset_dir / 'dataset_info.json'
+        manifest_path = dataset_dir / 'wbc_split_manifest.json'
+        if not info_path.exists() or not manifest_path.exists():
+            return False
+        try:
+            info = json.loads(info_path.read_text(encoding='utf-8'))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        if info.get('protocol_id') != protocol_id:
+            return False
+        for split in ('train', 'val', 'test'):
+            images = [p for p in (dataset_dir / split / 'images').iterdir() if p.is_file()]
+            masks = [p for p in (dataset_dir / split / 'masks').iterdir() if p.is_file()]
+            if len(images) != len(masks) or info.get(f'{split}_samples') != len(images):
+                return False
+        return True
 
     # Disjoint three-way group split into train/val/test (keeps near-duplicates from leaking). group_by='carid' groups by car number, None splits per image.
     def _grouped_three_way_split(self, pairs, val_ratio=0.1, test_ratio=0.1, group_by=None, seed=42):
@@ -162,7 +225,8 @@ class SegmentationDatasetPreparer:
         return buckets['train'], buckets['val'], buckets['test']
 #############################################################################################################################################
     # Main flow: prepare the requested dataset
-    def prepare_dataset(self, dataset_name: str, force: bool = False) -> bool:
+    def prepare_dataset(self, dataset_name: str, force: bool = False,
+                        wbc_protocol: str = 'paper-legacy-v1') -> bool:
         if dataset_name not in self.dataset_configs:
             logging.error(f"Unknown dataset: {dataset_name}")
             return False
@@ -170,9 +234,19 @@ class SegmentationDatasetPreparer:
         dataset_dir = self.data_root / dataset_name
         config = self.dataset_configs[dataset_name]
 
+        if wbc_protocol not in self.WBC_PROTOCOLS:
+            logging.error(f"Unknown WBC protocol: {wbc_protocol}")
+            return False
+
         if self._check_dataset_ready(dataset_dir) and not force:
-            logging.info(f"{dataset_name} dataset is already prepared")
-            return True
+            if dataset_name != 'wbc' or self._wbc_protocol_ready(dataset_dir, wbc_protocol):
+                logging.info(f"{dataset_name} dataset is already prepared")
+                return True
+            logging.error(
+                "Existing WBC data has missing, stale, or different protocol metadata. "
+                "Refusing to guess; rerun with --force and the intended --wbc_protocol."
+            )
+            return False
 
         self._create_directory_structure(dataset_dir)
 
@@ -181,7 +255,7 @@ class SegmentationDatasetPreparer:
 
         # dispatch to the preparation function of the dataset at hand
         if dataset_name == 'wbc':
-            return self._prepare_wbc(dataset_dir)
+            return self._prepare_wbc(dataset_dir, wbc_protocol)
         elif dataset_name == 'us_nerve':
             return self._prepare_us_nerve(dataset_dir)
         elif dataset_name == 'voc':
@@ -191,15 +265,145 @@ class SegmentationDatasetPreparer:
         else:
             return self._prepare_generic(dataset_dir, config)
 
-    # WBC dataset preparation: pair up the images and masks, then build the train/val/test splits
-    def _prepare_wbc(self, dataset_dir: Path) -> bool:
+    @staticmethod
+    def _resolve_wbc_legacy_collisions(pairs: List[Tuple[Path, Path]]):
+        """Make the historical last-write-wins selection explicit before any copy occurs."""
+        winners = {}
+        collision_events = []
+        for pair in pairs:
+            key = pair[0].name.casefold()
+            previous = winners.get(key)
+            if previous is not None:
+                collision_events.append((previous, pair))
+            winners[key] = pair
+        return list(winners.values()), collision_events
+
+    @staticmethod
+    def _wbc_full_name_map(pairs: List[Tuple[Path, Path]]):
+        """Use stable source indices as namespaces so all raw WBC pairs remain addressable."""
+        mapping = {}
+        for index, (image, mask) in enumerate(pairs):
+            image_name = f'{index:04d}__{image.name}'
+            mask_name = f'{index:04d}__{image.stem}{mask.suffix}'
+            mapping[image] = (image_name, mask_name)
+        if len({names[0].casefold() for names in mapping.values()}) != len(pairs):
+            raise RuntimeError("full-v2 failed to create unique WBC image names")
+        if len({names[1].casefold() for names in mapping.values()}) != len(pairs):
+            raise RuntimeError("full-v2 failed to create unique WBC mask names")
+        return mapping
+
+    @staticmethod
+    def _relative_wbc_source(path: Path, wbc_root: Path) -> str:
+        return path.relative_to(wbc_root).as_posix()
+
+    def _build_wbc_manifest(self, protocol_id: str, wbc_root: Path,
+                            prepared_by_split: dict, collision_events: dict):
+        samples = []
+        for split in ('train', 'val', 'test'):
+            for image, mask, image_name, mask_name in prepared_by_split[split]:
+                image_sha256 = self._sha256(image)
+                mask_sha256 = self._sha256(mask)
+                pair_sha256 = hashlib.sha256(
+                    f'{image_sha256}:{mask_sha256}'.encode('ascii')
+                ).hexdigest()
+                samples.append({
+                    'split': split,
+                    'output_image': image_name,
+                    'output_mask': mask_name,
+                    'source_image': self._relative_wbc_source(image, wbc_root),
+                    'source_mask': self._relative_wbc_source(mask, wbc_root),
+                    'image_sha256': image_sha256,
+                    'mask_sha256': mask_sha256,
+                    'pair_sha256': pair_sha256,
+                })
+
+        overlaps = {}
+        for field in ('source_image', 'image_sha256', 'mask_sha256', 'pair_sha256'):
+            first_split = {}
+            found = []
+            for sample in samples:
+                value = sample[field]
+                earlier = first_split.setdefault(value, sample['split'])
+                if earlier != sample['split']:
+                    found.append({'value': value, 'splits': sorted({earlier, sample['split']})})
+            overlaps[field] = found
+        # An identical mask alone can be legitimate, but repeated source/image/pair content crosses
+        # the sample-disjoint boundary and must fail closed.
+        leakage_fields = ('source_image', 'image_sha256', 'pair_sha256')
+        leaking = {field: overlaps[field] for field in leakage_fields if overlaps[field]}
+        if leaking:
+            raise RuntimeError(f'WBC cross-split leakage detected: {leaking}')
+
+        collision_rows = {}
+        for split, events in collision_events.items():
+            collision_rows[split] = [
+                {
+                    'excluded_source_image': self._relative_wbc_source(old[0], wbc_root),
+                    'kept_source_image': self._relative_wbc_source(new[0], wbc_root),
+                    'output_image': new[0].name,
+                }
+                for old, new in events
+            ]
+        canonical_samples = json.dumps(
+            samples, sort_keys=True, separators=(',', ':'), ensure_ascii=True
+        ).encode('utf-8')
+        return {
+            'schema_version': 1,
+            'dataset': 'wbc',
+            'protocol_id': protocol_id,
+            'split_seed': 42,
+            'sample_manifest_sha256': hashlib.sha256(canonical_samples).hexdigest(),
+            'sample_disjoint': True,
+            'cross_split_overlap_counts': {
+                field: len(values) for field, values in overlaps.items()
+            },
+            'collision_events': collision_rows,
+            'samples': samples,
+        }
+
+    @staticmethod
+    def _install_wbc_splits(dataset_dir: Path, staging_dir: Path):
+        """Swap only generated image/mask directories, restoring the old set on failure."""
+        backup_root = Path(tempfile.mkdtemp(prefix='.wbc_backup_', dir=dataset_dir))
+        states = []
+        try:
+            for split in ('train', 'val', 'test'):
+                for kind in ('images', 'masks'):
+                    source = staging_dir / split / kind
+                    target = dataset_dir / split / kind
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    backup = backup_root / split / kind
+                    state = {'target': target, 'backup': None, 'installed': False}
+                    if target.exists():
+                        backup.parent.mkdir(parents=True, exist_ok=True)
+                        target.rename(backup)
+                        state['backup'] = backup
+                    states.append(state)
+                    source.rename(target)
+                    state['installed'] = True
+        except Exception:
+            for state in reversed(states):
+                target, backup = state['target'], state['backup']
+                if state['installed'] and target.exists():
+                    shutil.rmtree(target)
+                if backup is not None and backup.exists():
+                    backup.rename(target)
+            if backup_root.exists():
+                shutil.rmtree(backup_root)
+            raise
+        else:
+            shutil.rmtree(backup_root)
+
+    # WBC dataset preparation with an explicit paper protocol and a separate full-data protocol.
+    def _prepare_wbc(self, dataset_dir: Path, protocol_id: str) -> bool:
         raw_dir = dataset_dir / 'raw'
-        wbc_dirs = list(raw_dir.glob('*WBC*')) or list(raw_dir.glob('segmentation_WBC*'))  # look for the WBC directory
+        wbc_dirs = sorted(p for p in raw_dir.glob('*WBC*') if p.is_dir())
         if not wbc_dirs:
             logging.error("WBC dataset directory not found")
             return False
+        wbc_root = wbc_dirs[0]
         pairs = []
-        for ds_dir in sorted(wbc_dirs[0].glob('Dataset*')):  # walk the subdirectories (sorting keeps the split reproducible)
+        for ds_dir in sorted(p for p in wbc_root.glob('Dataset*') if p.is_dir()):
             for bmp_path in sorted(ds_dir.glob('*.bmp')):    # look for the bmp images (sorting keeps the split reproducible)
                 png_path = ds_dir / f"{bmp_path.stem}.png"  # the matching mask png
                 if png_path.exists():
@@ -207,14 +411,77 @@ class SegmentationDatasetPreparer:
         if not pairs:
             logging.error("No paired data found")
             return False
-        tr, va, te = self._grouped_three_way_split(pairs, val_ratio=0.15, test_ratio=0.15, group_by=None)
-        self._copy_pairs_to_split(tr, dataset_dir / 'train')
-        self._copy_pairs_to_split(va, dataset_dir / 'val')
-        self._copy_pairs_to_split(te, dataset_dir / 'test')
+        tr, va, te = self._grouped_three_way_split(
+            pairs, val_ratio=0.15, test_ratio=0.15, group_by=None, seed=42)
+        nominal = {'train': tr, 'val': va, 'test': te}
+        collision_events = {split: [] for split in nominal}
+        if protocol_id == 'paper-legacy-v1':
+            selected = {}
+            for split, split_pairs in nominal.items():
+                selected[split], collision_events[split] = \
+                    self._resolve_wbc_legacy_collisions(split_pairs)
+            output_names = None
+        else:
+            selected = nominal
+            full_names = self._wbc_full_name_map(pairs)
+            output_names = lambda image, mask: full_names[image]
+
+        actual_counts = {split: len(split_pairs) for split, split_pairs in selected.items()}
+        if len(pairs) == 400:
+            expected = ({'train': 231, 'val': 58, 'test': 60}
+                        if protocol_id == 'paper-legacy-v1'
+                        else {'train': 280, 'val': 60, 'test': 60})
+            if actual_counts != expected:
+                raise RuntimeError(
+                    f'{protocol_id} canonical WBC counts changed: {actual_counts} != {expected}'
+                )
+
+        with tempfile.TemporaryDirectory(prefix='.wbc_prepare_', dir=dataset_dir) as tmp:
+            staging = Path(tmp)
+            prepared_by_split = {}
+            for split in ('train', 'val', 'test'):
+                prepared_by_split[split] = self._copy_pairs_to_split(
+                    selected[split], staging / split, output_names=output_names)
+            manifest = self._build_wbc_manifest(
+                protocol_id, wbc_root, prepared_by_split, collision_events)
+            self._install_wbc_splits(dataset_dir, staging)
+
+        installed_counts = {
+            split: len([p for p in (dataset_dir / split / 'images').iterdir() if p.is_file()])
+            for split in ('train', 'val', 'test')
+        }
+        if installed_counts != actual_counts:
+            raise RuntimeError(f'installed WBC counts do not match the prepared set: {installed_counts}')
+        manifest_path = dataset_dir / 'wbc_split_manifest.json'
+        self._save_json(manifest_path, manifest)
+        excluded_count = sum(len(events) for events in collision_events.values())
         self._save_dataset_info(dataset_dir, {
-            'name': 'wbc', 'num_classes': 3, 'split': 'per_image_3way',
-            'train_samples': len(tr), 'val_samples': len(va), 'test_samples': len(te)
+            'name': 'wbc',
+            'num_classes': 3,
+            'split': 'deterministic_per_image_3way',
+            'split_seed': 42,
+            'protocol_id': protocol_id,
+            'protocol_description': (
+                'Paper-release sample identities with explicit last-write-wins collision resolution.'
+                if protocol_id == 'paper-legacy-v1'
+                else 'Collision-safe full-data split for future experiments; not linked to paper metrics.'
+            ),
+            'raw_pair_count': len(pairs),
+            'prepared_pair_count': sum(installed_counts.values()),
+            'excluded_collision_pair_count': excluded_count,
+            'nominal_split_counts': {split: len(items) for split, items in nominal.items()},
+            'train_samples': installed_counts['train'],
+            'val_samples': installed_counts['val'],
+            'test_samples': installed_counts['test'],
+            'sample_disjoint': manifest['sample_disjoint'],
+            'cross_split_overlap_counts': manifest['cross_split_overlap_counts'],
+            'manifest': manifest_path.name,
+            'sample_manifest_sha256': manifest['sample_manifest_sha256'],
         })
+        logging.info(
+            "WBC protocol %s prepared: train %d / val %d / test %d (%d raw pairs, %d excluded collisions)",
+            protocol_id, installed_counts['train'], installed_counts['val'],
+            installed_counts['test'], len(pairs), excluded_count)
         return True
 
     # US_NERVE dataset preparation: generate empty masks (when there are none), then build the train/val/test splits
@@ -350,11 +617,11 @@ class SegmentationDatasetPreparer:
         return True
 
     # Prepare every dataset in the config
-    def prepare_all(self, force: bool = False):
+    def prepare_all(self, force: bool = False, wbc_protocol: str = 'paper-legacy-v1'):
         ok_all = True
         for name in self.dataset_configs:
             logging.info(f"\n{'=' * 60}\nPreparing the {name.upper()} dataset\n{'=' * 60}")
-            ok_all &= bool(self.prepare_dataset(name, force))
+            ok_all &= bool(self.prepare_dataset(name, force, wbc_protocol=wbc_protocol))
         return ok_all
 
 def main():
@@ -363,13 +630,20 @@ def main():
                         choices=['all', 'carvana', 'wbc', 'us_nerve', 'voc'])  # the supported dataset options
     parser.add_argument('--data_root', type=str, default='./data')  # data root directory
     parser.add_argument('--force', action='store_true')  # whether to force the dataset to be prepared again
+    parser.add_argument(
+        '--wbc_protocol', choices=SegmentationDatasetPreparer.WBC_PROTOCOLS,
+        default='paper-legacy-v1',
+        help=('paper-legacy-v1 reproduces the released 231/58/60 WBC sample identities; '
+              'full-v2 keeps all 400 raw pairs with collision-safe filenames for new experiments'),
+    )
     args = parser.parse_args()
 
     preparer = SegmentationDatasetPreparer(args.data_root)
     if args.dataset == 'all':
-        ok = preparer.prepare_all(args.force)  # prepare every dataset
+        ok = preparer.prepare_all(args.force, args.wbc_protocol)  # prepare every dataset
     else:
-        ok = preparer.prepare_dataset(args.dataset, args.force)  # prepare the requested dataset
+        ok = preparer.prepare_dataset(
+            args.dataset, args.force, wbc_protocol=args.wbc_protocol)  # prepare the requested dataset
     # Respect the return value: main() used to throw it away, so "No paired data found" printed a single error line and then
     # exited with code 0, handing anyone following the README an empty dataset and a "success". Failure has to be loud.
     if not ok:
