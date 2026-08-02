@@ -68,10 +68,10 @@ def clean_eval_row(data, source):
     experiment = experiment or source_stem
 
     patterns = [
-        (r'^rev_(\w+?)_(traditional|fcn|no_aux|fixed|tpls)(?:_m\d+)?(?:_s\d+)?$', 'main_clean'),
-        (r'^lift_(\w+?)_(\w+?)(?:_s\d+)?$', 'lift_ablation_clean'),
-        (r'^recon_(\w+?)_(tradgi|admm-l1)(?:_s\d+)?$', 'reconstruction_clean'),
-        (r'^ta_(\w+?)_(hsi|cs)(?:_\w+)?(?:_s\d+)?$', 'task_adapted_clean'),
+        (r'^rev_([A-Za-z0-9][A-Za-z0-9-]*)_(traditional|fcn|no_aux|fixed|tpls)(?:_m\d+)?(?:_s\d+)?$', 'main_clean'),
+        (r'^lift_([A-Za-z0-9][A-Za-z0-9-]*)_([A-Za-z0-9][A-Za-z0-9-]*)(?:_s\d+)?$', 'lift_ablation_clean'),
+        (r'^recon_([A-Za-z0-9][A-Za-z0-9-]*)_(tradgi|admm-l1)(?:_s\d+)?$', 'reconstruction_clean'),
+        (r'^ta_([A-Za-z0-9][A-Za-z0-9-]*)_(hsi|cs)(?:_[A-Za-z0-9-]+)?(?:_s\d+)?$', 'task_adapted_clean'),
     ]
     match = family = None
     for regex, candidate_family in patterns:
@@ -116,14 +116,20 @@ def noise_eval_row(data, source):
     experiment = (name if name.endswith(('ns1', 'ns2', 'ns3')) or '_ns' in name
                   else basename.replace('_test.json', ''))
 
-    match = re.match(r'rev_(\w+?)_(tpls|fcn)_(?:m512_)?s(\d+)', name)
+    match = re.match(
+        r'^rev_([A-Za-z0-9][A-Za-z0-9-]*)_(tpls|fcn)_(?:m512_)?s(\d+)(?:_|$)',
+        name,
+    )
     if match:
         dataset, model, seed = match.groups()
         ckpt = data.get('ckpt') or f'checkpoints/rev_{dataset}_{model}_m512_s{seed}'
         return _base_row(experiment, dataset, model, 'noise_ac', metrics, basename,
                          ckpt, seed=seed, eval_noise_db=snr, environment='rev2026-07')
 
-    match = re.match(r'ta_(\w+?)_(hsi|cs)_s(\d+)_snr', name)
+    match = re.match(
+        r'^ta_([A-Za-z0-9][A-Za-z0-9-]*)_(hsi|cs)_s(\d+)_snr(?:_|$)',
+        name,
+    )
     if match:
         dataset, method, seed = match.groups()
         if seed == '42':  # legacy master CSV already owns this arm
@@ -132,7 +138,10 @@ def noise_eval_row(data, source):
                          basename, f'checkpoints/ta_{dataset}_{method}_s{seed}',
                          seed=seed, eval_noise_db=snr, environment='rev2026-07')
 
-    match = re.match(r'ta_(\w+?)_hsi_(naug20|naugmix)_snr', name)
+    match = re.match(
+        r'^ta_([A-Za-z0-9][A-Za-z0-9-]*)_hsi_(naug20|naugmix)_snr(?:_|$)',
+        name,
+    )
     if match:
         dataset, tag = match.groups()
         return _base_row(experiment, dataset, f'ta_hsi_{tag}', 'ta_noise_naug',
