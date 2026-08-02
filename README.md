@@ -53,6 +53,8 @@ Three datasets are used: **Carvana** (binary vehicle masks), **MNIST** (binary d
 foreground), and **WBC** (3-class white-blood-cell). MNIST downloads automatically via
 torchvision. Download the other two yourself:
 
+Dataset files are not distributed by this repository. Before downloading or publishing a derivative, review the source-specific terms and attribution notes in [THIRD_PARTY_DATA.md](THIRD_PARTY_DATA.md); the repository's MIT license covers code, not third-party datasets.
+
 - **Carvana** — [Kaggle Carvana Image Masking Challenge](https://www.kaggle.com/c/carvana-image-masking-challenge)
   (`train.zip` + `train_masks.zip`: `*.jpg` images with `*_mask.gif` masks).
 - **WBC** — [zxaoyou/segmentation_WBC](https://github.com/zxaoyou/segmentation_WBC)
@@ -94,6 +96,8 @@ python -m scripts.evaluate --ckpt_path checkpoints/rev_carvana_tpls_s42/best.pth
 its exact byte count, Git LFS SHA-256 object ID, legacy MD5, and clean test foreground mIoU.
 The download above uses a real immutable Hugging Face commit because no release tag exists.
 Training from scratch needs no download.
+
+The Hugging Face model card is the canonical detailed description of intended use and limitations. [MODEL_CARD.md](MODEL_CARD.md) records the code/weight license split and immutable references without duplicating the full card.
 
 ## Running the experiments
 
