@@ -34,6 +34,20 @@ from src.utils.reconstruction_manifest import (
     build_reconstruction_inventory,
     inventory_sha256,
 )
+from src.utils.path_safety import safe_child_directory
+
+
+@pytest.mark.parametrize(
+    'name', ['', '.', '..', '../escape', '..\\escape', '/tmp/escape', ' trailing'],
+)
+def test_experiment_output_name_cannot_escape_root(tmp_path, name):
+    with pytest.raises((TypeError, ValueError), match='experiment_name'):
+        safe_child_directory(tmp_path, name)
+
+
+def test_experiment_output_name_preserves_released_names(tmp_path):
+    assert safe_child_directory(
+        tmp_path, 'rev_wbc_tpls_m512_s42') == tmp_path / 'rev_wbc_tpls_m512_s42'
 
 
 def test_checkpoint_loader_does_not_implicitly_fallback_to_pickle(monkeypatch):

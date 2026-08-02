@@ -7,6 +7,7 @@ from src.metrics.segmentation_metrics import batch_segmentation_metrics
 from src.utils.tb_logger import TBLogger
 from src.utils.model_utils import count_parameters
 from src.utils.gradient_diagnostics import append_jsonl, measure_loss_gradients
+from src.utils.path_safety import safe_child_directory
 
 
 class SegmentationTrainer:
@@ -101,9 +102,12 @@ class SegmentationTrainer:
                     "stepwise phase ratios must produce three non-empty phases over the configured steps"
                 )
 
-        self.ckpt_dir = Path(config['training']['checkpoint_dir']) / config['training']['experiment_name']
+        experiment_name = config['training']['experiment_name']
+        self.ckpt_dir = safe_child_directory(
+            config['training']['checkpoint_dir'], experiment_name)
         requested_tb = bool(config['logging'].get('use_tensorboard', True))
-        tb_dir = Path(config['logging'].get('tb_logdir', 'runs')) / config['training']['experiment_name']
+        tb_dir = safe_child_directory(
+            config['logging'].get('tb_logdir', 'runs'), experiment_name)
         if config['training'].get('refuse_existing_output', False):
             self.ckpt_dir.parent.mkdir(parents=True, exist_ok=True)
             try:
@@ -128,7 +132,7 @@ class SegmentationTrainer:
             try:
                 self.tb = TBLogger(
                     config['logging'].get('tb_logdir', 'runs'),
-                    config['training']['experiment_name'],
+                    experiment_name,
                     config
                 )
                 self.tb.define_metric("train/*", "epoch")

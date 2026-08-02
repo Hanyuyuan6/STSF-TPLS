@@ -41,17 +41,26 @@ for f in (glob.glob(os.path.join(OVN, '**', '*.json'), recursive=True) if os.env
     name = d.get('experiment') or d.get('experiment_name') or os.path.basename(f)
     snr = d.get('noise_snr_db'); ns = d.get('noise_seed')
     # image-free: rev_{ds}_{tpls|fcn}_m512_s{seed}
-    mo = re.match(r'rev_(\w+?)_(tpls|fcn)_m512_s(\d+)', name)
+    mo = re.match(
+        r'^rev_([A-Za-z0-9][A-Za-z0-9-]*)_(tpls|fcn)_m512_s(\d+)(?:_|$)',
+        name,
+    )
     if mo:
         ds, mdl, seed = mo.group(1), mo.group(2), mo.group(3)
         add(ds, 'stsf' if mdl == 'tpls' else 'spifs', seed, snr, ns, fg); continue
     # TA seed: ta_{ds}_{hsi|cs}_s{seed}
-    mo = re.match(r'ta_(\w+?)_(hsi|cs)_s(\d+)', name)
+    mo = re.match(
+        r'^ta_([A-Za-z0-9][A-Za-z0-9-]*)_(hsi|cs)_s(\d+)(?:_|$)',
+        name,
+    )
     if mo:
         ds, meth, seed = mo.group(1), mo.group(2), mo.group(3)
         add(ds, f'ta_{meth}', seed, snr, ns, fg); continue
     # TA naug: ta_{ds}_hsi_{naug20|naugmix}
-    mo = re.match(r'ta_(\w+?)_hsi_(naug20|naugmix)', name)
+    mo = re.match(
+        r'^ta_([A-Za-z0-9][A-Za-z0-9-]*)_hsi_(naug20|naugmix)(?:_|$)',
+        name,
+    )
     if mo:
         ds, tag = mo.group(1), mo.group(2)
         add(ds, f'ta_{tag}', 42, snr, ns, fg); continue
@@ -72,10 +81,16 @@ if os.path.exists(CSV):
             # family, but run_all.sh / the README train the same 3.13% models under the
             # plain `rev_<ds>_<model>` name. Requiring the suffix silently dropped every
             # image-free row a fresh clone produces (empty table, exit 0).
-            m2 = re.match(r'rev_(\w+?)_(tpls|fcn)(?:_m512)?(?:_|$)', exp)
+            m2 = re.match(
+                r'^rev_([A-Za-z0-9][A-Za-z0-9-]*)_(tpls|fcn)(?:_m512)?(?:_|$)',
+                exp,
+            )
             if m2: add(m2.group(1), 'stsf' if m2.group(2) == 'tpls' else 'spifs', seed, snr, ns, fg)
         else:  # ta_noise
-            m3 = re.match(r'ta_(\w+?)_(hsi|cs)', exp)
+            m3 = re.match(
+                r'^ta_([A-Za-z0-9][A-Za-z0-9-]*)_(hsi|cs)(?:_|$)',
+                exp,
+            )
             if m3: add(m3.group(1), f'ta_{m3.group(2)}', seed, snr, ns, fg)
 
 # --- guard: no input resolved (a fresh clone ships neither the overnight JSONs nor the CSV) ---
