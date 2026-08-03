@@ -62,16 +62,20 @@ def clean_eval_row(data, source):
         return None
 
     source_stem = os.path.splitext(os.path.basename(source))[0]
-    source_stem = re.sub(r'_test$', '', source_stem)
+    source_stem = re.sub(r'_(?:clean_)?test$', '', source_stem)
     declared = data.get('experiment') or data.get('experiment_name') or ''
     experiment = source_stem if re.search(r'_s\d+', source_stem) else declared
     experiment = experiment or source_stem
 
+    # ``run_all.sh`` appends a safe RUN_ID after the seed. Keep that suffix in
+    # the experiment id (so separate runs do not deduplicate), while parsing
+    # the dataset/model/seed from the stable prefix.
+    seeded_run = r'(?:_s\d+(?:_[A-Za-z0-9][A-Za-z0-9._-]*)?)?'
     patterns = [
-        (r'^rev_([A-Za-z0-9][A-Za-z0-9-]*)_(traditional|fcn|no_aux|fixed|tpls)(?:_m\d+)?(?:_s\d+)?$', 'main_clean'),
-        (r'^lift_([A-Za-z0-9][A-Za-z0-9-]*)_([A-Za-z0-9][A-Za-z0-9-]*)(?:_s\d+)?$', 'lift_ablation_clean'),
-        (r'^recon_([A-Za-z0-9][A-Za-z0-9-]*)_(tradgi|admm-l1)(?:_s\d+)?$', 'reconstruction_clean'),
-        (r'^ta_([A-Za-z0-9][A-Za-z0-9-]*)_(hsi|cs)(?:_[A-Za-z0-9-]+)?(?:_s\d+)?$', 'task_adapted_clean'),
+        (rf'^rev_([A-Za-z0-9][A-Za-z0-9-]*)_(traditional|fcn|no_aux|fixed|tpls)(?:_m\d+)?{seeded_run}$', 'main_clean'),
+        (rf'^lift_([A-Za-z0-9][A-Za-z0-9-]*)_([A-Za-z0-9][A-Za-z0-9-]*){seeded_run}$', 'lift_ablation_clean'),
+        (rf'^recon_([A-Za-z0-9][A-Za-z0-9-]*)_(tradgi|admm-l1){seeded_run}$', 'reconstruction_clean'),
+        (rf'^ta_([A-Za-z0-9][A-Za-z0-9-]*)_(hsi|cs)(?:_[A-Za-z0-9-]+)?{seeded_run}$', 'task_adapted_clean'),
     ]
     match = family = None
     for regex, candidate_family in patterns:

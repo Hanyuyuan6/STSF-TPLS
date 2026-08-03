@@ -444,6 +444,68 @@ def test_merge_results_accepts_clean_eval_json():
     assert row['miou_fg'] == '75.0000'
 
 
+def test_merge_results_accepts_released_clean_test_filename():
+    data = {
+        'experiment_name': 'rev_wbc_tpls_s43',
+        'dataset': 'wbc',
+        'bucket_size': 512,
+        'train_seed': 43,
+        'ckpt': 'checkpoints/rev_wbc_tpls_s43/best.pth',
+        'noise_snr_db': None,
+        'metrics': {'miou_fg': 0.520601, 'mdice_fg': 0.68},
+    }
+    row = clean_eval_row(
+        data,
+        'checkpoints/rev_wbc_tpls_s43/eval/'
+        'rev_wbc_tpls_m512_s43_clean_test.json',
+    )
+    assert row is not None
+    assert row['experiment'] == 'rev_wbc_tpls_m512_s43'
+    assert row['family'] == 'main_clean'
+    assert row['seed'] == '43'
+    assert row['miou_fg'] == '52.0601'
+
+
+def test_merge_results_accepts_run_all_id_suffix():
+    cases = [
+        (
+            'rev_carvana_tpls_s42_20260803T120000Z',
+            'rev_carvana_tpls_s42_20260803T120000Z',
+            'carvana', 'main_clean', 'tpls',
+        ),
+        (
+            'lift_wbc_attn_s42_20260803T120000Z',
+            'lift_wbc_attn_s42_20260803T120000Z',
+            'wbc', 'lift_ablation_clean', 'lift_attn',
+        ),
+        (
+            'recon_mnist_tradgi_s42_20260803T120000Z',
+            'rev_mnist_traditional_s42_20260803T120000Z',
+            'mnist', 'reconstruction_clean', 'tradgi',
+        ),
+    ]
+    for artifact_experiment, declared, dataset, family, model in cases:
+        data = {
+            'experiment_name': declared,
+            'dataset': dataset,
+            'bucket_size': 512,
+            'train_seed': 42,
+            'ckpt': f'checkpoints/{declared}/best.pth',
+            'noise_snr_db': None,
+            'metrics': {'miou_fg': 0.75, 'mdice_fg': 0.86},
+        }
+        row = clean_eval_row(
+            data,
+            f'_rev/results/run_all/20260803T120000Z/'
+            f'{artifact_experiment}.json',
+        )
+        assert row is not None
+        assert row['experiment'] == artifact_experiment
+        assert row['family'] == family
+        assert row['model'] == model
+        assert row['seed'] == '42'
+
+
 def test_run_artifact_validator_checks_contract_and_hashes(tmp_path):
     artifact = tmp_path / 'results' / 'eval.json'
     artifact.parent.mkdir()
