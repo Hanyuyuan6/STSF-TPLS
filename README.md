@@ -1,6 +1,6 @@
 # STSF-TPLS
 
-> Segment straight from single-pixel measurements — no image reconstruction in the loop.
+> Segment straight from single-pixel measurements — no reconstructed image is consumed by the segmentation head.
 
 [![arXiv](https://img.shields.io/badge/arXiv-2607.22077-b31b1b.svg)](https://arxiv.org/abs/2607.22077)
 [![License](https://img.shields.io/github/license/Hanyuyuan6/STSF-TPLS)](LICENSE)
@@ -9,9 +9,21 @@
 [![PyTorch](https://img.shields.io/badge/pytorch-2.13.0-red)](https://pytorch.org/)
 
 A bidirectional GRU encodes the ordered 1D measurement sequence, a content-adaptive cross-attention
-lift maps it onto a 2D feature grid, and a U-Net++ head decodes the mask — no intermediate image is
-reconstructed. Official code for **"The Lift Spectrum: How Measurement-to-Space Adaptivity Shapes
-Robustness in Image-Free Single-Pixel Sensing"** ([arXiv:2607.22077](https://arxiv.org/abs/2607.22077)).
+lift maps it directly onto a 2D task-feature grid, and a U-Net++ head decodes the mask. A separate
+learned reconstruction branch supplies TPLS supervision during training only. Released checkpoints
+retain this branch, and the current `forward` returns `aux_recon`; the segmentation logits never
+consume that output, and the branch can be pruned for deployment. Official code for **"The Lift
+Spectrum: How Measurement-to-Space Adaptivity Shapes Robustness in Image-Free Single-Pixel Sensing"**
+([arXiv:2607.22077](https://arxiv.org/abs/2607.22077)).
+
+## What the paper establishes
+
+- Under clean acquisition, the strongest task-adapted fixed-physics reconstruction baseline is more
+  accurate; under the tested noise calibration, the ranking reverses.
+- At 20 dB, the reconstructed task input receives a 20–70× larger normalized relative perturbation
+  than the direct image-free input under the released protocol.
+- These claims are scoped to the fixed natural-order Hadamard acquisition, three reported datasets,
+  and tested sampling/noise ranges; the physical bench is a proof of concept.
 
 ## Quick start
 
