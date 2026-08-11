@@ -1,0 +1,103 @@
+# ==========================================================================
+# STSF-TPLS
+# Leading "/" anchors a pattern to the repo root; unanchored = any depth.
+# ==========================================================================
+
+# --- datasets (not distributed; see README "Data") ---
+/data/
+/data_rev/
+
+# --- training / evaluation outputs ---
+/checkpoints/
+/ckpts/
+/results/
+/realtest_out/
+# predict_from_bucket.py's default --save_path
+/seg_pred.png
+/runs/
+/eval_vis*/
+/recon_vis*/
+/recon_all_*/
+/predictions*/
+/phys_recon*/
+/_rev/
+/_phys_quant/
+/_phys_quant_notes/
+/data_recon*/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.mat
+*.log
+
+# --- local snapshots & archives (never shipped) ---
+/_bak_archive/
+/_ckpts_*/
+/_sweep_results_*/
+/_archive*/
+/_rerun_*/
+/_eval_vis*/
+**/_vis_src/
+/_reverify_*/
+/_RELEASE_PREP_*.md
+# local private verification workspace — never shipped.
+# Keep this comment on its own line: `#` only opens a comment at column 1, so an inline
+# one becomes part of the pattern and the rule silently matches nothing.
+/_trust/
+/tmp/
+*.tgz
+*.tar.gz
+*.bak
+*.bak_*
+*_DONE
+
+# --- non-deliverable working files ---
+*.pptx
+
+# --- figures & docs: kept local, not shipped (code-only repo) ---
+/figures_out/
+/docs/
+
+# --- local private workspace (not part of the public release) ---
+/paper/
+
+# --- secrets & credentials (defense in depth; none should ever exist here) ---
+.env
+.env.*
+*.key
+*.pem
+*.token
+credentials.json
+.credentials.json
+secrets.toml
+.npmrc
+.pypirc
+.aws/
+.ssh/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.eggs/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.coverage
+.coverage.*
+htmlcov/
+
+# --- tooling / editors / OS ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini

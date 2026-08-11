@@ -1,0 +1,59 @@
+base: '../base_config.yaml'
+
+data:
+  dataset: 'wbc'
+  train_dir: 'data_rev/wbc/train'
+  val_dir: 'data_rev/wbc/val'
+  img_size: 128
+  bucket_size: 128
+  classes: 3
+
+model:
+  name: 'FCNUNetPP'
+  params:
+    bucket_size: 128
+    img_size: 128
+    classes: 3
+    init_feat_hw: 32
+    init_feat_ch: 1
+    fsrcnn_d: 56
+    fsrcnn_s: 12
+    fsrcnn_m: 4
+    unetpp_in_ch: 64
+    unetpp_base: 64
+    bilinear: true
+    use_se: false
+    use_cbam: false
+    use_aspp: false
+    droppath_prob: 0
+    use_aux_recon_head: true
+
+training:
+  epochs: 180
+  batch_size: 6
+  early_stopping_patience: 180
+  experiment_name: 'rev_wbc_fcn_m128'
+  learning_rate: 5e-4
+  scheduler: 'CosineAnnealingLR'
+  scheduler_params:
+    T_max: 180
+    eta_min: 1e-6
+  loss:
+    seg:
+      name: 'CombinedSegmentationLoss'
+      params:
+        dice_weight: 0.5
+        ce_weight: 0.5
+    aux_recon:
+      name: 'CombinedReconLoss'
+      params:
+        l1_weight: 0.3
+        l2_weight: 0.3
+        ssim_weight: 0.4
+    seg_weight: 1.0
+    aux_recon_weight: 0.0
+    adaptive_loss:
+      enable: false
+
+inference:
+  threshold: 0.5

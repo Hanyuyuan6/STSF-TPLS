@@ -1,0 +1,15 @@
+# Current reviewed direct dependency pins (Python 3.10, standard PyPI wheels).
+# Transitive resolution is not hash-locked. Historical environments are provenance only.
+torch==2.13.0
+torchvision==0.28.0
+numpy==1.26.4
+scipy==1.15.3
+opencv-python==4.11.0.86
+Pillow==12.3.0
+scikit-learn==1.7.2
+matplotlib==3.10.7
+tqdm==4.67.1
+PyYAML==6.0.3
+tensorboard==2.20.0
+kornia==0.8.2
+pytest==9.1.1
