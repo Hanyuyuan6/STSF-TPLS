@@ -271,7 +271,7 @@ tensorboard --logdir runs
   | Study | Configs |
   |---|---|
   | Sampling-rate sweep | `rev_{carvana,mnist}_{fcn,tpls}_m{64,128,256,512,1024,2048}`, `rev_wbc_{fcn,tpls}_m{64,128,256,1024,2048}` |
-  | Noise-augmented training | `rev_carvana_{fcn,tpls}_tn{20,30}` |
+  | Noise-augmented training (deprecated: superseded full-sequence noise reference) | `rev_carvana_{fcn,tpls}_tn{20,30}` |
   | Reconstruct-then-segment baseline | `ta_{carvana,mnist,wbc}_{cs,hsi}`, rate points `…_m{64,128,256,1024,2048}` |
   | Noise-augmented TA probes | `ta_mnist_hsi_naug{20,mix}` |
   | Acquisition-order ablation | `rev_mnist_tpls_perm123` |

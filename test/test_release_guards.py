@@ -1,7 +1,9 @@
 import copy
+import csv
 import io
 import json
 from pathlib import Path
+import re
 import stat
 import tarfile
 import zipfile
@@ -13,7 +15,7 @@ from PIL import Image
 from scipy.io import savemat
 from scipy.linalg import hadamard
 
-from scripts.merge_results import clean_eval_row
+from scripts.merge_results import clean_eval_row, noise_eval_row
 from scripts.predict_from_bucket import load_bucket
 from scripts.predict_reconstruct import load_buckets
 from scripts.prepare_seg_datasets import SegmentationDatasetPreparer
@@ -538,3 +540,86 @@ def test_run_artifact_validator_checks_contract_and_hashes(tmp_path):
     artifact.write_text(json.dumps(content), encoding='utf-8')
     with pytest.raises(ValueError, match='metrics must contain exactly'):
         write_manifest('smoke', [spec], Path('results/truncated.json'), root=tmp_path)
+
+
+def _ta_noise_eval_experiment(**fields):
+    """The experiment name scripts/ta_noise_eval.py writes, read from its source so that a
+    rename on the producer side breaks this test instead of silently dropping rows."""
+    source = (Path(__file__).resolve().parents[1] / 'scripts' / 'ta_noise_eval.py').read_text(
+        encoding='utf-8')
+    template = re.search(r"'experiment': f'([^']+)'", source).group(1)
+    return template.format(**fields)
+
+
+def _noise_json(experiment, noise_ref='ac', split='test', snr=20):
+    data = {'experiment': experiment, 'noise_ref': noise_ref, 'split': split,
+            'noise_snr_db': snr, 'noise_seed': 1,
+            'metrics': {'miou_fg': 0.5, 'mdice_fg': 0.6}}
+    return {key: value for key, value in data.items() if value is not None}
+
+
+@pytest.mark.parametrize('method, seed, family', [
+    ('hsi', 42, 'ta_noise'),
+    ('cs', 43, 'ta_noise'),
+    ('hsi', 44, 'ta_noise'),
+    ('hsi_naug20', 42, 'ta_noise_naug'),
+    ('hsi_naugmix', 42, 'ta_noise_naug'),
+])
+def test_noise_merge_accepts_ta_noise_eval_output(method, seed, family):
+    name = _ta_noise_eval_experiment(ds='mnist', method=method, seed=seed, snr=20, ns=1)
+    row = noise_eval_row(_noise_json(name), f'results/ta_noise/{name}_test.json')
+    assert row is not None, name
+    assert row['family'] == family
+    assert row['seed'] == str(seed)
+    assert row['eval_noise_db'] == '20'
+
+
+@pytest.mark.parametrize('name, family', [
+    ('ta_carvana_cs_snr10_ns1', 'ta_noise'),
+    ('ta_mnist_hsi_naug20_snr10_ns1', 'ta_noise_naug'),
+])
+def test_noise_merge_reads_legacy_seed42_names(name, family):
+    row = noise_eval_row(_noise_json(name, snr=10), f'per_run_eval/{name}_test.json')
+    assert row is not None
+    assert row['family'] == family
+    assert row['seed'] == '42'
+
+
+def test_noise_merge_accepts_ac_test_image_free_eval():
+    name = 'rev_mnist_tpls_m512_s43_snr20_ns1'
+    row = noise_eval_row(_noise_json(name), f'checkpoints/x/eval/{name}_test.json')
+    assert row is not None
+    assert row['family'] == 'noise_ac'
+    assert row['seed'] == '43'
+
+
+@pytest.mark.parametrize('noise_ref, split', [
+    ('full', 'test'), ('ac', 'val'), ('full', 'val'), (None, None),
+])
+def test_noise_merge_rejects_other_reference_or_split(noise_ref, split, capsys):
+    name = 'rev_mnist_tpls_m512_s43_snr20_ns1'
+    data = _noise_json(name, noise_ref=noise_ref, split=split)
+    assert noise_eval_row(data, f'checkpoints/x/eval/{name}_test.json') is None
+    assert 'skipped' in capsys.readouterr().err
+
+
+def test_noise_merge_counts_a_seed42_run_once_under_either_spelling(tmp_path, monkeypatch):
+    import scripts.merge_results as merge_results
+    incoming = tmp_path / 'incoming'
+    incoming.mkdir()
+    for name in ('ta_carvana_cs_snr10_ns1', 'ta_carvana_cs_s42_snr10_ns1'):
+        (incoming / f'{name}_test.json').write_text(
+            json.dumps(_noise_json(name, snr=10)), encoding='utf-8')
+    monkeypatch.setattr(merge_results, 'ROOT', str(tmp_path))
+
+    fresh = tmp_path / 'fresh.csv'
+    merge_results.main([str(tmp_path / 'absent.csv'), str(fresh)])
+    fresh_rows = [r for r in csv.DictReader(fresh.open()) if r['family'] == 'ta_noise']
+    assert [r['experiment'] for r in fresh_rows] == ['ta_carvana_cs_s42_snr10_ns1']
+
+    legacy_csv = tmp_path / 'legacy.csv'
+    legacy_csv.write_text('experiment,family,seed\nta_carvana_cs_snr10_ns1,ta_noise,42\n',
+                          encoding='utf-8')
+    appended = tmp_path / 'appended.csv'
+    merge_results.main([str(legacy_csv), str(appended)])
+    assert sum(r['family'] == 'ta_noise' for r in csv.DictReader(appended.open())) == 1

@@ -1,3 +1,5 @@
+# DEPRECATED: trains with measurement noise referenced to the full sequence (the superseded
+# calibration). Kept for provenance only; not part of the released noise protocol.
 base: '../base_config.yaml'
 
 data:
