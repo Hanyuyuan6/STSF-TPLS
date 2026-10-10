@@ -26,13 +26,16 @@ def main():
     parser.add_argument('--out_json', type=str, default=None, help='write the metrics to this JSON (merge_results.py ingests it only when --noise_snr_db was set)')
     parser.add_argument('--noise_snr_db', type=float, default=None,
                         help='measurement-domain Gaussian noise SNR (dB) at eval time; for the train-clean/eval-noisy robustness sweep, off by default')
-    parser.add_argument('--noise_ref', type=str, default='full', choices=['full', 'ac'],
-                        help="reference for the SNR sigma: full=std over the whole sequence (historical behaviour), ac=AC std after dropping the DC row (comparable across datasets)")
+    parser.add_argument('--noise_ref', type=str, default=None, choices=['full', 'ac'],
+                        help="reference for the SNR sigma, required with --noise_snr_db: ac=AC std after dropping the DC row (comparable across datasets; the released noise protocol), full=std over the whole sequence (historical behaviour)")
     parser.add_argument('--noise_seed', type=int, default=None,
                         help='random seed for the evaluation noise (seeds the draw when not None, making the noise reproducible; several seeds give the error bars)')
     parser.add_argument('--allow_unsafe_pickle', action='store_true',
                         help='allow weights_only=False only for a checkpoint you independently trust')
     args = parser.parse_args()
+    if args.noise_snr_db is not None and args.noise_ref is None:
+        parser.error('--noise_snr_db requires --noise_ref: "ac" (DC row excluded; the released noise '
+                     'protocol) or "full" (historical whole-sequence reference)')
 
     if args.noise_seed is not None:
         torch.manual_seed(args.noise_seed)

@@ -16,7 +16,9 @@ Config via env vars (defaults reproduce the released grid):
 Output: results/ta_noise/ta_{ds}_{method}_s{seed}_snr{snr}_ns{ns}_test.json  (idempotent; skips done)
 Gracefully skips (logs MISS) when a ckpt is absent.
 
-Example (one cell):  SEEDS=42 DATASETS=mnist METHODS=hsi SNRS=20 NSEEDS=1 python -m scripts.ta_noise_eval"""
+Example (one cell):  SEEDS=42 DATASETS=mnist METHODS=hsi SNRS=20 NSEEDS=1 python -m scripts.ta_noise_eval
+Noise-augmented TA probes (ckpts ta_mnist_hsi_naug{20,mix}_s42) take the same HSI path:
+  SEEDS=42 DATASETS=mnist METHODS="hsi hsi_naug20 hsi_naugmix" SNRS="40 30 20 15 10" python -m scripts.ta_noise_eval"""
 import json, os, sys, torch
 sys.path.insert(0, os.getcwd())
 from torch.utils.data import DataLoader
@@ -73,7 +75,7 @@ def run(ds, method, seed):
                 ref = raw[:, 1:]
                 sigma = ref.std(dim=1, keepdim=True) * (10.0 ** (-snr / 20.0))
                 noisy = raw + sigma * torch.randn_like(raw)
-                if method == 'hsi':
+                if method.split('_')[0] == 'hsi':  # hsi and its noise-augmented variants hsi_naug*
                     rec = adjoint_recon(noisy)
                 else:
                     rec_np = admm_l1_recon(A_np, noisy.cpu().numpy(), IMG,

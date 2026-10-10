@@ -105,14 +105,40 @@ def clean_eval_row(data, source):
     )
 
 
+_TA_NOISE_NAME = re.compile(
+    r'^(ta_[A-Za-z0-9][A-Za-z0-9-]*_(?:hsi_naug20|hsi_naugmix|hsi|cs))(?:_s(\d+))?(_snr\d+(?:_.*)?)$')
+
+
+def canonical_noise_experiment(name):
+    """Key a TA noise evaluation as ta_<ds>_<method>_s<seed>_snr<db>_ns<k>.
+
+    Older seed-42 evaluations spell the same run without `_s42`; keying both spellings alike lets a
+    merge, and its de-duplication against an existing CSV, count each run once.
+    """
+    match = _TA_NOISE_NAME.match(name)
+    if match is None:
+        return name
+    prefix, seed, rest = match.groups()
+    return f'{prefix}_s{seed or "42"}{rest}'
+
+
 def noise_eval_row(data, source):
-    """Map a supported AC-referenced noise JSON to one row, or return None."""
+    """Map a supported AC-referenced noise JSON to one row, or return None.
+
+    Only test-split evaluations whose noise was referenced to the AC component are merged; a noise
+    JSON with any other (or a missing) ``noise_ref``/``split`` is skipped with a note on stderr.
+    """
     metrics = data.get('metrics')
     snr = data.get('noise_snr_db')
     if not isinstance(metrics, dict) or snr is None:
         return None
     basename = os.path.basename(source)
     if re.search(r'_test_ac\d|_ns77\d|_test_snr\d', basename):
+        return None
+    if data.get('noise_ref') != 'ac' or data.get('split') != 'test':
+        print(f"merge_results: skipped {basename}: noise_ref={data.get('noise_ref')!r} "
+              f"split={data.get('split')!r} (only AC-referenced test-split noise evals are merged)",
+              file=sys.stderr)
         return None
 
     name = data.get('experiment') or data.get('experiment_name') or basename
@@ -130,27 +156,28 @@ def noise_eval_row(data, source):
         return _base_row(experiment, dataset, model, 'noise_ac', metrics, basename,
                          ckpt, seed=seed, eval_noise_db=snr, environment='rev2026-07')
 
+    # scripts/ta_noise_eval.py names its output ta_<ds>_<method>_s<seed>_snr<db>_ns<k>.
+    # Older seed-42 evaluations omit the `_s<seed>` field; they are seed 42 by construction.
     match = re.match(
-        r'^ta_([A-Za-z0-9][A-Za-z0-9-]*)_(hsi|cs)_s(\d+)_snr(?:_|$)',
+        r'^ta_([A-Za-z0-9][A-Za-z0-9-]*)_(hsi|cs)(?:_s(\d+))?_snr\d+(?:_|$)',
         name,
     )
     if match:
         dataset, method, seed = match.groups()
-        if seed == '42':  # legacy master CSV already owns this arm
-            return None
-        return _base_row(experiment, dataset, f'ta_{method}', 'ta_noise', metrics,
-                         basename, f'checkpoints/ta_{dataset}_{method}_s{seed}',
+        seed = seed or '42'
+        return _base_row(canonical_noise_experiment(experiment), dataset, f'ta_{method}',
+                         'ta_noise', metrics, basename, f'checkpoints/ta_{dataset}_{method}_s{seed}',
                          seed=seed, eval_noise_db=snr, environment='rev2026-07')
 
     match = re.match(
-        r'^ta_([A-Za-z0-9][A-Za-z0-9-]*)_hsi_(naug20|naugmix)_snr(?:_|$)',
+        r'^ta_([A-Za-z0-9][A-Za-z0-9-]*)_hsi_(naug20|naugmix)(?:_s(\d+))?_snr\d+(?:_|$)',
         name,
     )
     if match:
-        dataset, tag = match.groups()
-        return _base_row(experiment, dataset, f'ta_hsi_{tag}', 'ta_noise_naug',
-                         metrics, basename, f'checkpoints/ta_{dataset}_hsi_{tag}',
-                         seed=42, eval_noise_db=snr, environment='rev2026-07')
+        dataset, tag, seed = match.groups()
+        return _base_row(canonical_noise_experiment(experiment), dataset, f'ta_hsi_{tag}',
+                         'ta_noise_naug', metrics, basename, f'checkpoints/ta_{dataset}_hsi_{tag}',
+                         seed=seed or '42', eval_noise_db=snr, environment='rev2026-07')
     return None
 
 
@@ -163,7 +190,7 @@ def main(argv=None):
     if os.path.exists(csv_in):
         with open(csv_in, newline='', encoding='utf-8') as handle:
             existing = list(csv.DictReader(handle))
-    seen = {row['experiment'] for row in existing}
+    seen = {canonical_noise_experiment(row['experiment']) for row in existing}
 
     paths = (
         glob.glob(os.path.join(ROOT, 'incoming', '**', '*.json'), recursive=True)
