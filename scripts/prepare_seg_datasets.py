@@ -80,7 +80,7 @@ class SegmentationDatasetPreparer:
             with tarfile.open(archive_path, 'r:*') as tf:
                 dest = extract_to.resolve()
                 for member in tqdm(tf.getmembers(), desc="Extracting files"):
-                    # CVE-2007-4559 path-traversal guard: the tarfile of Python 3.10 has no default filter,
+                    # CVE-2007-4559 path-traversal guard: tarfile applies no extraction filter by default before Python 3.14,
                     # so check member by member that the landing point is still inside dest (rejecting ../ escapes and absolute-path members).
                     target = (extract_to / member.name).resolve()
                     if target != dest and dest not in target.parents:
