@@ -5,7 +5,7 @@
 [![arXiv](https://img.shields.io/badge/arXiv-2607.22077-b31b1b.svg)](https://arxiv.org/abs/2607.22077)
 [![License](https://img.shields.io/github/license/Hanyuyuan6/STSF-TPLS)](LICENSE)
 [![CI](https://github.com/Hanyuyuan6/STSF-TPLS/actions/workflows/tests.yml/badge.svg)](https://github.com/Hanyuyuan6/STSF-TPLS/actions)
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/pytorch-2.13.0-red)](https://pytorch.org/)
 
 A bidirectional GRU encodes the ordered 1D measurement sequence, a content-adaptive cross-attention
@@ -22,7 +22,7 @@ Spectrum: How Measurement-to-Space Adaptivity Shapes Robustness in Image-Free Si
 Runs end-to-end on a fresh clone: no dataset to download (torchvision fetches MNIST), no GPU needed.
 
 ```bash
-conda create -n sps python=3.10 && conda activate sps
+conda create -n sps python=3.11 && conda activate sps
 pip install -r requirements.txt       # reviewed exact direct pins; transitive resolution is not hash-locked
 
 python -m pytest test/ -q            # the GPU-parity test self-skips without CUDA
@@ -36,7 +36,7 @@ Every command in this README assumes **the repo root as the working directory** 
 `python -m scripts.<name>` form; running a script by path (`python scripts/evaluate.py`) fails with
 `ModuleNotFoundError: No module named 'src'`.
 
-`requirements.txt` pins every direct dependency in the current reviewed Python 3.10 environment
+`requirements.txt` pins every direct dependency in the current reviewed Python 3.11 environment
 (PyTorch 2.13.0); transitive packages are resolver-selected rather than locked by hashes. For provenance,
 the original paper evaluation used PyTorch 2.3.0+cu118 and training was cross-checked on 2.7.0+cu128.
 Those historical, known-vulnerable versions are recorded only to explain the reported artifacts:
